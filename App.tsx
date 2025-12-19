@@ -80,6 +80,8 @@ const App: React.FC = () => {
   
   // Anti-loop refs
   const lastVadTriggerRef = useRef<number>(0);
+  // State refs for greeting
+  const hasGreetedRef = useRef<boolean>(false);
 
   // --- API KEY ---
   useEffect(() => {
@@ -95,7 +97,7 @@ const App: React.FC = () => {
     if (typeof chrome === 'undefined' || !chrome.runtime) return;
 
     const handleMessage = (message: any) => {
-      // console.log("UI: Mensaje recibido", message); // Descomentar para debug intenso
+      // console.log("UI: Mensaje recibido", message); 
       
       if (message.type !== MessageType.CONTEXT_UPDATE) return;
       
@@ -114,49 +116,64 @@ const App: React.FC = () => {
       const payload = message.payload as ContextPayload;
       
       // FIX: Validación de payload nulo o vacío
-      if (!payload || !payload.url || payload.event === 'NO_CONTEXT') {
-        console.log("UI: Contexto recibido es null o inválido, ignorando.");
-        return;
-      }
-
-      const now = Date.now();
-
-      // 2. COOLDOWN
-      if (now - lastAiSpeechTimeRef.current < AI_COOLDOWN_MS) {
-          console.log("UI: Cooldown activo, ignorando evento");
-          return;
-      }
-
-      console.log("UI: Procesando contexto para Gemini...", payload);
+      if (!payload) return;
 
       sessionPromiseRef.current.then(async (session) => {
-        if (currentSessionIdRef.current) {
-          
-          // --- ESTRATEGIA: TRIGGER DE SISTEMA AUTÓNOMO ---
-          
-          const contextMsg = `[SYSTEM: EVENTO DETECTADO.
-          TIPO: ${payload.event}
-          URL: ${payload.url}
-          TÍTULO: "${payload.title}"
-          ${payload.selection ? `SELECCIÓN: "${payload.selection}"` : ''}
-          INSTRUCCIÓN: Reacciona ahora con audio sarcástico sobre esto.]`;
+        if (!currentSessionIdRef.current) return;
 
-          // A. Enviamos el contexto
-          try {
-            await session.sendRealtimeInput({
-              content: [{ text: contextMsg }]
-            });
+        // --- CASO 1: SALUDO INICIAL (NO_CONTEXT) ---
+        if ((payload.event === 'NO_CONTEXT' || !payload.url) && !hasGreetedRef.current) {
+            console.log("UI: Contexto vacío detectado en Listener. Iniciando saludo sarcástico...");
+            hasGreetedRef.current = true;
+            
+            const greetingMsg = `[SYSTEM: Acabas de activarte. El usuario te está observando pero aún no ha hecho nada interesante. Salúdalo con sarcasmo y preséntate como su juez personal 😒. Sé breve.]`;
+            
+            try {
+              await session.sendRealtimeInput({ content: [{ text: greetingMsg }] });
+              setTimeout(() => {
+                 if (currentSessionIdRef.current) session.sendRealtimeInput({ endOfTurn: true } as any);
+              }, 100);
+            } catch(e) { console.error(e); }
+            return;
+        }
 
-            // B. TRIGGER EXPLICITO: Forzamos el cierre de turno inmediatamente.
-            setTimeout(() => {
-               if (currentSessionIdRef.current) {
-                  console.log("UI: Enviando endOfTurn: true (Evento)");
-                  session.sendRealtimeInput({ endOfTurn: true } as any);
-               }
-            }, 100); 
-          } catch (e) {
-            console.error("UI: Error enviando contexto a Gemini", e);
-          }
+        // --- CASO 2: IGNORAR CONTEXTO VACÍO POSTERIOR ---
+        if (payload.event === 'NO_CONTEXT' || !payload.url) {
+           return; 
+        }
+
+        // --- CASO 3: CONTEXTO REAL ---
+        const now = Date.now();
+        // 2. COOLDOWN
+        if (now - lastAiSpeechTimeRef.current < AI_COOLDOWN_MS) {
+            console.log("UI: Cooldown activo, ignorando evento");
+            return;
+        }
+
+        console.log("UI: Procesando contexto para Gemini...", payload);
+        
+        const contextMsg = `[SYSTEM: EVENTO DETECTADO.
+        TIPO: ${payload.event}
+        URL: ${payload.url}
+        TÍTULO: "${payload.title}"
+        ${payload.selection ? `SELECCIÓN: "${payload.selection}"` : ''}
+        INSTRUCCIÓN: Reacciona ahora con audio sarcástico sobre esto.]`;
+
+        // A. Enviamos el contexto
+        try {
+          await session.sendRealtimeInput({
+            content: [{ text: contextMsg }]
+          });
+
+          // B. TRIGGER EXPLICITO: Forzamos el cierre de turno inmediatamente.
+          setTimeout(() => {
+             if (currentSessionIdRef.current) {
+                console.log("UI: Enviando endOfTurn: true (Evento)");
+                session.sendRealtimeInput({ endOfTurn: true } as any);
+             }
+          }, 100); 
+        } catch (e) {
+          console.error("UI: Error enviando contexto a Gemini", e);
         }
       });
     };
@@ -258,6 +275,7 @@ const App: React.FC = () => {
     
     const thisSessionId = Date.now().toString();
     currentSessionIdRef.current = thisSessionId;
+    hasGreetedRef.current = false; // Reset greeting flag
 
     try {
       dispatch({ type: 'START_CONNECTING' });
@@ -310,30 +328,42 @@ const App: React.FC = () => {
                     return;
                  }
 
-                 // FIX: Verificar si es un contexto válido o el dummy NO_CONTEXT
-                 if (response && response.event !== 'NO_CONTEXT' && response.url && currentSessionIdRef.current === thisSessionId) {
+                 if (response && currentSessionIdRef.current === thisSessionId) {
                     console.log("UI: Contexto inicial recibido del Background:", response);
                     
                     sessionPromise.then(async (session) => {
-                          const contextMsg = `[SYSTEM: CONTEXTO INICIAL AL CONECTAR.
-                          URL: ${response.url}
-                          TÍTULO: "${response.title}"
-                          INSTRUCCIÓN: Comenta sarcásticamente dónde estamos empezando.]`;
                           
-                          console.log("UI: Enviando mensaje de inicio a Gemini...");
-                          await session.sendRealtimeInput({ content: [{ text: contextMsg }] });
-                          
-                          // TRIGGER INMEDIATO
-                          setTimeout(() => {
-                             if (currentSessionIdRef.current === thisSessionId) {
-                                console.log("UI: Enviando endOfTurn: true (Inicio)");
-                                session.sendRealtimeInput({ endOfTurn: true } as any);
-                             }
-                          }, 100);
+                          // --- LÓGICA DE SALUDO INICIAL (ON CONNECT) ---
+                          if ((response.event === 'NO_CONTEXT' || !response.url) && !hasGreetedRef.current) {
+                               console.log("UI: Sin contexto inicial. Enviando saludo sarcástico...");
+                               hasGreetedRef.current = true;
+                               const greetingMsg = `[SYSTEM: Acabas de activarte. El usuario te está observando pero aún no ha hecho nada interesante. Salúdalo con sarcasmo y preséntate como su juez personal 😒. Sé breve.]`;
+                               await session.sendRealtimeInput({ content: [{ text: greetingMsg }] });
+                               
+                               setTimeout(() => {
+                                  if (currentSessionIdRef.current === thisSessionId) session.sendRealtimeInput({ endOfTurn: true } as any);
+                               }, 100);
+                               return;
+                          }
+
+                          // --- LÓGICA DE CONTEXTO REAL (ON CONNECT) ---
+                          if (response.url && response.url !== "") {
+                              const contextMsg = `[SYSTEM: CONTEXTO INICIAL AL CONECTAR.
+                              URL: ${response.url}
+                              TÍTULO: "${response.title}"
+                              INSTRUCCIÓN: Comenta sarcásticamente dónde estamos empezando.]`;
+                              
+                              console.log("UI: Enviando mensaje de inicio a Gemini con contexto...");
+                              await session.sendRealtimeInput({ content: [{ text: contextMsg }] });
+                              
+                              setTimeout(() => {
+                                if (currentSessionIdRef.current === thisSessionId) {
+                                    console.log("UI: Enviando endOfTurn: true (Inicio)");
+                                    session.sendRealtimeInput({ endOfTurn: true } as any);
+                                }
+                              }, 100);
+                          }
                      });
-                 } else {
-                     console.log("UI: Contexto inicial vacío (NO_CONTEXT) o inválido. Manteniendo silencio.");
-                     // No enviamos nada a Gemini, se queda en IDLE esperando nuevos eventos.
                  }
               });
             }
@@ -412,6 +442,7 @@ const App: React.FC = () => {
 
   const stopSession = () => {
     currentSessionIdRef.current = null;
+    hasGreetedRef.current = false; // Reset al desconectar
     stopAllAudioOutput();
     if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
     if (processorRef.current) { try { processorRef.current.disconnect(); } catch (e) {} processorRef.current = null; }

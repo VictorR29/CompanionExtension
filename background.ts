@@ -6,6 +6,7 @@ declare const chrome: any;
 let assistantWindowId: number | null = null;
 // MEMORIA: Guardamos el último contexto recibido (variable 'i' en tu descripción conceptual)
 let lastContext: ContextPayload | null = null;
+let hasLoggedFirstContext = false;
 
 // Listener principal
 chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResponse: any) => {
@@ -37,7 +38,13 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
     // A. Guardar en memoria (Persistencia de sesión)
     if (message.payload) {
       lastContext = message.payload;
-      console.log("Background: Contexto actualizado en memoria:", lastContext);
+      
+      if (!hasLoggedFirstContext && message.payload.event !== 'NO_CONTEXT') {
+        console.log("Background: Primer contexto real recibido 🟢", lastContext);
+        hasLoggedFirstContext = true;
+      } else {
+        console.log("Background: Contexto actualizado en memoria:", lastContext);
+      }
     }
 
     // B. Reenviar a la UI (App.tsx) con DELAY

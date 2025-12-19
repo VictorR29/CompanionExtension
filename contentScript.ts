@@ -10,7 +10,7 @@ const isExtensionCtx = typeof chrome !== 'undefined' && chrome.runtime && chrome
 let debounceTimer: any = null;
 const DEBOUNCE_DELAY = 1500; // Delay para agrupar eventos rápidos
 
-function sendContextUpdate(event: 'NAVIGATION' | 'SELECTION' | 'VISIBILITY_VISIBLE' | 'SCROLL') {
+function sendContextUpdate(event: 'NAVIGATION' | 'SELECTION' | 'VISIBILITY_VISIBLE' | 'SCROLL' | 'INITIAL_LOAD') {
   if (!isExtensionCtx) return;
 
   // Clear pending updates
@@ -45,7 +45,7 @@ function sendContextUpdate(event: 'NAVIGATION' | 'SELECTION' | 'VISIBILITY_VISIB
     } catch (e) {
       console.error("Error capturando contexto:", e);
     }
-  }, DEBOUNCE_DELAY);
+  }, event === 'INITIAL_LOAD' ? 500 : DEBOUNCE_DELAY); // INITIAL_LOAD es más rápido
 }
 
 // 1. Navigation Detection (SPA + Standard)
@@ -89,5 +89,5 @@ window.addEventListener('scroll', () => {
   }
 });
 
-// Initial Load
-sendContextUpdate('NAVIGATION');
+// Initial Load - Forzamos actualización inmediata para despertar al asistente
+sendContextUpdate('INITIAL_LOAD');
