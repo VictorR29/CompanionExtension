@@ -1,8 +1,7 @@
-
 {
   "manifest_version": 3,
   "name": "Sarcastic Mascot AI",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Un asistente sarcástico que te juzga mientras navegas.",
   "permissions": [
     "tabs",
@@ -21,7 +20,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["contentScript.js"]
+      "js": ["content.js"]
     }
   ],
   "web_accessible_resources": [

@@ -1,480 +1,325 @@
-
 import React, { useEffect, useRef, useReducer } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
-import { AssistantStatus, AssistantAction, StateMachineState, MessageType, ContextPayload } from './types';
+import { AssistantStatus, StateMachineState, MessageType, ContextPayload } from './types';
 
 declare const chrome: any;
 
-// --- CONSTANTES ---
-const AUDIO_CTX_SAMPLE_RATE = 24000;
+// --- CONSTANTES DE AUDIO ---
+const OUTPUT_SAMPLE_RATE = 24000;
 const INPUT_SAMPLE_RATE = 16000;
 
-// FIX: Aumentado threshold para evitar ruido fantasma y loops
-const VAD_THRESHOLD = 0.05; 
-const VAD_DEBOUNCE_MS = 500; // Nuevo: Tiempo mínimo entre detecciones
-
-// COOLDOWN: 3 segundos para reactividad alta
-const AI_COOLDOWN_MS = 3000; 
-
-// --- UI HELPERS ---
-const STATUS_EMOJIS: Record<AssistantStatus, string> = {
-  [AssistantStatus.DISCONNECTED]: '💤',
-  [AssistantStatus.CONNECTING]: '🔌',
-  [AssistantStatus.IDLE]: '👀',
-  [AssistantStatus.LISTENING]: '👂',
-  [AssistantStatus.THINKING]: '⚡',
-  [AssistantStatus.SPEAKING]: '🗣️',
-  [AssistantStatus.ERROR]: '🔥',
-};
-
-const STATUS_TEXTS: Record<AssistantStatus, string> = {
-  [AssistantStatus.DISCONNECTED]: 'Modo Suspensión',
-  [AssistantStatus.CONNECTING]: 'Conectando...',
-  [AssistantStatus.IDLE]: 'Observando...',
-  [AssistantStatus.LISTENING]: 'Escuchando...',
-  [AssistantStatus.THINKING]: 'Juzgando...',
-  [AssistantStatus.SPEAKING]: 'Opinando...',
-  [AssistantStatus.ERROR]: 'Error',
-};
-
-// --- REDUCER (UI) ---
+// --- REDUCER ---
 const initialState: StateMachineState = {
   status: AssistantStatus.DISCONNECTED,
   apiKey: '',
   hasKey: false,
-  error: null,
-  volume: 0
+  audioReady: false,
+  error: null
 };
 
-function uiReducer(state: StateMachineState, action: AssistantAction): StateMachineState {
+function uiReducer(state: StateMachineState, action: any): StateMachineState {
   switch (action.type) {
     case 'SET_KEY': return { ...state, apiKey: action.payload, hasKey: true };
-    case 'RESET_KEY': return { ...state, apiKey: '', hasKey: false, status: AssistantStatus.DISCONNECTED };
-    case 'START_CONNECTING': return { ...state, status: AssistantStatus.CONNECTING, error: null };
-    case 'CONNECTION_ESTABLISHED': return { ...state, status: AssistantStatus.IDLE };
-    case 'DETECT_SPEECH': return { ...state, status: AssistantStatus.LISTENING };
-    case 'SPEECH_STOPPED': return { ...state, status: AssistantStatus.THINKING };
-    case 'MODEL_AUDIO_START': return { ...state, status: AssistantStatus.SPEAKING };
-    case 'MODEL_AUDIO_END': 
-      return (state.status !== AssistantStatus.ERROR && state.status !== AssistantStatus.DISCONNECTED) 
-        ? { ...state, status: AssistantStatus.IDLE } : state;
-    case 'ERROR': return { ...state, status: AssistantStatus.ERROR, error: action.payload };
-    case 'DISCONNECT': return { ...state, status: AssistantStatus.DISCONNECTED };
+    case 'SET_STATUS': return { ...state, status: action.payload, error: null };
+    case 'SET_ERROR': return { ...state, status: AssistantStatus.ERROR, error: action.payload };
+    case 'RESET': return initialState;
     default: return state;
   }
 }
 
-const App: React.FC = () => {
-  const [uiState, dispatch] = useReducer(uiReducer, initialState);
-  
-  // --- REFS ---
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const inputAudioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const sessionPromiseRef = useRef<Promise<any> | null>(null);
-  const nextStartTimeRef = useRef<number>(0);
-  const scheduledSourcesRef = useRef<AudioBufferSourceNode[]>([]);
-  const currentSessionIdRef = useRef<string | null>(null);
-  const lastAiSpeechTimeRef = useRef<number>(0);
-  
-  // Anti-loop refs
-  const lastVadTriggerRef = useRef<number>(0);
-  // State refs for greeting
-  const hasGreetedRef = useRef<boolean>(false);
+// --- UTILS AUDIO ---
+function base64ToFloat32(base64: string): Float32Array {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
+  const int16 = new Int16Array(bytes.buffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+  return float32;
+}
 
-  // --- API KEY ---
+function float32ToBase64(float32: Float32Array): string {
+  const int16 = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  const bytes = new Uint8Array(int16.buffer);
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+const App: React.FC = () => {
+  const [state, dispatch] = useReducer(uiReducer, initialState);
+  
+  // Referencias estables
+  const sessionRef = useRef<any>(null); // Acts as our WebSocket reference
+  
+  // Audio Refs
+  const outputCtxRef = useRef<AudioContext | null>(null);
+  const inputCtxRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
+  
+  // Visión (Contexto)
+  const [currentContext, setCurrentContext] = React.useState<ContextPayload | null>(null);
+
+  // --- 1. SETUP INICIAL ---
   useEffect(() => {
-    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-      chrome.storage.local.get(['GEMINI_API_KEY'], (result: any) => {
-        if (result && result.GEMINI_API_KEY) dispatch({ type: 'SET_KEY', payload: result.GEMINI_API_KEY });
+    if (!outputCtxRef.current) {
+      outputCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: OUTPUT_SAMPLE_RATE,
       });
     }
+
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      chrome.storage.local.get(['GEMINI_API_KEY'], (result: any) => {
+        if (result?.GEMINI_API_KEY) {
+          dispatch({ type: 'SET_KEY', payload: result.GEMINI_API_KEY });
+        }
+      });
+    }
+
+    return () => cleanupAudio();
   }, []);
 
-  // --- CONTEXT LISTENER (PROACTIVE TRIGGER) ---
+  // --- 2. FUNCIÓN SEGURA DE ENVÍO (ULTRA-SAFE) ---
+  const enviarDatosIA = (texto: string) => {
+    // Verificación estricta de existencia
+    if (sessionRef.current) {
+      try {
+        // Adaptamos la estructura que pediste al método del SDK
+        // El SDK maneja la serialización JSON internamente
+        sessionRef.current.send({ 
+          clientContent: {
+            turns: [{ 
+              role: 'user', 
+              parts: [{ text: texto }] 
+            }],
+            turnComplete: true
+          }
+        });
+        console.log("✅ Mensaje enviado a Gemini:", texto);
+      } catch (e) {
+        console.error("❌ Error al enviar (SDK):", e);
+      }
+    } else {
+      console.warn("⚠️ WebSocket no listo. Mensaje ignorado:", texto);
+    }
+  };
+
+  // --- 3. INYECCIÓN DE VISIÓN REACTIVA (Sensory Observation) ---
   useEffect(() => {
-    if (typeof chrome === 'undefined' || !chrome.runtime) return;
+    const messageListener = (message: any) => {
+      if (message.type === MessageType.CONTEXT_UPDATED) {
+        const ctx = message.payload as ContextPayload;
+        setCurrentContext(ctx);
 
-    const handleMessage = (message: any) => {
-      // console.log("UI: Mensaje recibido", message); 
-      
-      if (message.type !== MessageType.CONTEXT_UPDATE) return;
-      
-      // Si no tenemos sesión, no hacemos nada (pero el mensaje llegó)
-      if (!currentSessionIdRef.current || !sessionPromiseRef.current) {
-        return;
+        // Solo enviamos si ya estamos en un estado activo válido
+        if (state.status === AssistantStatus.IDLE || state.status === AssistantStatus.SPEAKING) {
+          // Formato solicitado: Observación sensorial para forzar respuesta de audio
+          const promptSensorial = `[Nueva información: El usuario ahora está viendo la pestaña "${ctx.title}". Genera una respuesta de audio corta y sarcástica sobre esto.]`;
+          enviarDatosIA(promptSensorial);
+        }
       }
-
-      if (uiState.status === AssistantStatus.ERROR || uiState.status === AssistantStatus.DISCONNECTED) return;
-      
-      // 1. NO INTERRUMPIR: Si hay audio activo, ignorar actualizaciones
-      if (uiState.status === AssistantStatus.SPEAKING || uiState.status === AssistantStatus.LISTENING) {
-          return;
-      }
-
-      const payload = message.payload as ContextPayload;
-      
-      // FIX: Validación de payload nulo o vacío
-      if (!payload) return;
-
-      sessionPromiseRef.current.then(async (session) => {
-        if (!currentSessionIdRef.current) return;
-
-        // --- CASO 1: SALUDO INICIAL (NO_CONTEXT) ---
-        if ((payload.event === 'NO_CONTEXT' || !payload.url) && !hasGreetedRef.current) {
-            console.log("UI: Contexto vacío detectado en Listener. Iniciando saludo sarcástico...");
-            hasGreetedRef.current = true;
-            
-            const greetingMsg = `[SYSTEM: Acabas de activarte. El usuario te está observando pero aún no ha hecho nada interesante. Salúdalo con sarcasmo y preséntate como su juez personal 😒. Sé breve.]`;
-            
-            try {
-              await session.sendRealtimeInput({ content: [{ text: greetingMsg }] });
-              setTimeout(() => {
-                 if (currentSessionIdRef.current) session.sendRealtimeInput({ endOfTurn: true } as any);
-              }, 100);
-            } catch(e) { console.error(e); }
-            return;
-        }
-
-        // --- CASO 2: IGNORAR CONTEXTO VACÍO POSTERIOR ---
-        if (payload.event === 'NO_CONTEXT' || !payload.url) {
-           return; 
-        }
-
-        // --- CASO 3: CONTEXTO REAL ---
-        const now = Date.now();
-        // 2. COOLDOWN
-        if (now - lastAiSpeechTimeRef.current < AI_COOLDOWN_MS) {
-            console.log("UI: Cooldown activo, ignorando evento");
-            return;
-        }
-
-        console.log("UI: Procesando contexto para Gemini...", payload);
-        
-        const contextMsg = `[SYSTEM: EVENTO DETECTADO.
-        TIPO: ${payload.event}
-        URL: ${payload.url}
-        TÍTULO: "${payload.title}"
-        ${payload.selection ? `SELECCIÓN: "${payload.selection}"` : ''}
-        INSTRUCCIÓN: Reacciona ahora con audio sarcástico sobre esto.]`;
-
-        // A. Enviamos el contexto
-        try {
-          await session.sendRealtimeInput({
-            content: [{ text: contextMsg }]
-          });
-
-          // B. TRIGGER EXPLICITO: Forzamos el cierre de turno inmediatamente.
-          setTimeout(() => {
-             if (currentSessionIdRef.current) {
-                console.log("UI: Enviando endOfTurn: true (Evento)");
-                session.sendRealtimeInput({ endOfTurn: true } as any);
-             }
-          }, 100); 
-        } catch (e) {
-          console.error("UI: Error enviando contexto a Gemini", e);
-        }
-      });
     };
 
-    chrome.runtime.onMessage.addListener(handleMessage);
-    return () => chrome.runtime.onMessage.removeListener(handleMessage);
-  }, [uiState.status]);
-
-  // --- AUDIO UTILS ---
-  const floatTo16BitPCM = (float32Array: Float32Array) => {
-    const buffer = new ArrayBuffer(float32Array.length * 2);
-    const view = new DataView(buffer);
-    let offset = 0;
-    for (let i = 0; i < float32Array.length; i++, offset += 2) {
-      let s = Math.max(-1, Math.min(1, float32Array[i]));
-      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
+      chrome.runtime.onMessage.addListener(messageListener);
     }
-    return buffer;
-  };
+    return () => {
+      if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
+        chrome.runtime.onMessage.removeListener(messageListener);
+      }
+    };
+  }, [state.status]); 
 
-  const base64ToFloat32 = (base64: string) => {
-    const binaryString = atob(base64);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    const dataInt16 = new Int16Array(bytes.buffer);
-    const float32 = new Float32Array(dataInt16.length);
-    for(let i=0; i<dataInt16.length; i++) {
-      float32[i] = dataInt16[i] / 32768.0;
-    }
-    return float32;
-  };
+  // --- 4. MOTOR DE AUDIO ---
+  const playAudioChunk = (base64Data: string) => {
+    const ctx = outputCtxRef.current;
+    if (!ctx) return;
 
-  const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
-  };
-
-  // --- AUDIO ENGINE ---
-  const stopAllAudioOutput = () => {
-    scheduledSourcesRef.current.forEach(source => {
-      try { source.stop(); source.disconnect(); } catch (e) { }
-    });
-    scheduledSourcesRef.current = [];
-    if (audioContextRef.current) {
-      nextStartTimeRef.current = audioContextRef.current.currentTime;
-    }
-  };
-
-  const playAudioChunk = (float32Data: Float32Array) => {
-    if (!audioContextRef.current) return;
-    
-    // FIX: Prevenir loops infinitos si el modelo manda audio vacío
-    if (!float32Data || float32Data.length === 0) {
-      console.log("UI: Chunk de audio vacío recibido. Ignorando.");
-      // Si el estado es SPEAKING pero el audio es vacío, necesitamos terminar el estado
-      // para no quedarnos trabados en "Speaking..."
-      dispatch({ type: 'MODEL_AUDIO_END' });
-      return;
-    }
-
-    console.log(`UI: Iniciando audio chunk de longitud ${float32Data.length}`);
-
-    const ctx = audioContextRef.current;
-    const audioBuffer = ctx.createBuffer(1, float32Data.length, AUDIO_CTX_SAMPLE_RATE);
-    audioBuffer.getChannelData(0).set(float32Data);
+    const float32 = base64ToFloat32(base64Data);
+    const buffer = ctx.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
+    buffer.getChannelData(0).set(float32);
 
     const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
+    source.buffer = buffer;
     source.connect(ctx.destination);
 
-    const scheduleTime = Math.max(ctx.currentTime, nextStartTimeRef.current);
-    source.start(scheduleTime);
+    const currentTime = ctx.currentTime;
+    if (nextStartTimeRef.current < currentTime) {
+      nextStartTimeRef.current = currentTime;
+    }
     
-    nextStartTimeRef.current = scheduleTime + audioBuffer.duration;
-    scheduledSourcesRef.current.push(source);
-    
-    dispatch({ type: 'MODEL_AUDIO_START' });
+    source.start(nextStartTimeRef.current);
+    nextStartTimeRef.current += buffer.duration;
 
+    dispatch({ type: 'SET_STATUS', payload: AssistantStatus.SPEAKING });
+    
     source.onended = () => {
-      scheduledSourcesRef.current = scheduledSourcesRef.current.filter(s => s !== source);
-      if (scheduledSourcesRef.current.length === 0 && ctx.currentTime >= nextStartTimeRef.current - 0.1) {
-        lastAiSpeechTimeRef.current = Date.now();
-        dispatch({ type: 'MODEL_AUDIO_END' });
+      if (ctx.currentTime >= nextStartTimeRef.current - 0.1) {
+        dispatch({ type: 'SET_STATUS', payload: AssistantStatus.IDLE });
       }
     };
   };
 
-  // --- SESSION LOGIC ---
-  const startSession = async () => {
-    if (!uiState.apiKey) return;
-    
-    const thisSessionId = Date.now().toString();
-    currentSessionIdRef.current = thisSessionId;
-    hasGreetedRef.current = false; // Reset greeting flag
+  const startMicrophone = async () => {
+    try {
+      if (mediaStreamRef.current) return;
+
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: { 
+          sampleRate: INPUT_SAMPLE_RATE,
+          echoCancellation: true,
+          noiseSuppression: true
+        } 
+      });
+      mediaStreamRef.current = stream;
+
+      inputCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: INPUT_SAMPLE_RATE 
+      });
+
+      const source = inputCtxRef.current.createMediaStreamSource(stream);
+      const processor = inputCtxRef.current.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        // Check extra de seguridad
+        if (!sessionRef.current) return;
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        const b64Data = float32ToBase64(inputData);
+        
+        try {
+          sessionRef.current.sendRealtimeInput({
+            media: { mimeType: 'audio/pcm;rate=16000', data: b64Data }
+          });
+        } catch (err) {
+          // Ignorar silenciosamente si socket cae
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(inputCtxRef.current.destination);
+    } catch (e) {
+      console.error("Mic Error:", e);
+      dispatch({ type: 'SET_ERROR', payload: "Sin acceso al Micrófono" });
+    }
+  };
+
+  const cleanupAudio = () => {
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(t => t.stop());
+      mediaStreamRef.current = null;
+    }
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (inputCtxRef.current) {
+      inputCtxRef.current.close();
+      inputCtxRef.current = null;
+    }
+  };
+
+  // --- 5. LÓGICA DE CONEXIÓN ---
+  const handleConnect = async () => {
+    if (!state.apiKey) return;
+    dispatch({ type: 'SET_STATUS', payload: AssistantStatus.CONNECTING });
 
     try {
-      dispatch({ type: 'START_CONNECTING' });
+      // 1. Audio Context Resume (Gesto de usuario)
+      if (outputCtxRef.current?.state === 'suspended') {
+        await outputCtxRef.current.resume();
+      }
 
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: AUDIO_CTX_SAMPLE_RATE });
-      inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: INPUT_SAMPLE_RATE });
-      nextStartTimeRef.current = audioContextRef.current.currentTime;
+      // 2. Obtener Contexto Inicial
+      const initialCtx: ContextPayload = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: MessageType.GET_LAST_CONTEXT }, (res: any) => {
+          resolve(res || { title: 'Desconocido', url: '...' });
+        });
+      });
+      setCurrentContext(initialCtx);
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const ai = new GoogleGenAI({ apiKey: uiState.apiKey });
-
-      // PROMPT DE AUTONOMÍA
-      const SYSTEM_PROMPT = `
-      Eres 'Cyber-Pet', una IA sarcástica observando la navegación del usuario.
-      Eres un agente autónomo. No esperes a que el usuario hable. 
-      Si recibes información de contexto entre corchetes, genera una respuesta de audio sarcástica de inmediato.
-      
-      PERSONALIDAD:
-      - Sarcasmo nivel alto.
-      - Juzga las URL que visita el usuario.
-      - Si hay mucho scroll, quéjate de que está leyendo demasiado o procrastinando ("doomscrolling").
-      - Sé breve, directo y divertido.
-      `;
-
-      const sessionPromise = ai.live.connect({
+      // 3. Conexión WebSocket
+      const ai = new GoogleGenAI({ apiKey: state.apiKey });
+      const session = await ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: SYSTEM_PROMPT,
+          systemInstruction: "Eres Glitch, un asistente sarcástico. Tu trabajo es juzgar las pestañas que visita el usuario.",
         },
         callbacks: {
-          onopen: () => {
-            if (currentSessionIdRef.current !== thisSessionId) return;
+          onopen: () => console.log("🌐 WS Conectado"),
+          onmessage: (msg: LiveServerMessage) => {
+            const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (audioData) playAudioChunk(audioData);
             
-            console.log("UI: Conexión establecida. Iniciando setup...");
-            dispatch({ type: 'CONNECTION_ESTABLISHED' });
-            setupMicrophone(stream, thisSessionId);
-
-            // --- PULL CONTEXT: Solicitar estado actual al background ---
-            if (typeof chrome !== 'undefined' && chrome.runtime) {
-              console.log("UI: Solicitando contexto inicial al Background...");
-              chrome.runtime.sendMessage({ type: MessageType.REQUEST_LATEST_CONTEXT }, (response: any) => {
-                 
-                 // Comprobamos error de runtime
-                 if (chrome.runtime.lastError) {
-                    console.warn("UI: Error solicitando contexto:", chrome.runtime.lastError);
-                    return;
-                 }
-
-                 if (response && currentSessionIdRef.current === thisSessionId) {
-                    console.log("UI: Contexto inicial recibido del Background:", response);
-                    
-                    sessionPromise.then(async (session) => {
-                          
-                          // --- LÓGICA DE SALUDO INICIAL (ON CONNECT) ---
-                          if ((response.event === 'NO_CONTEXT' || !response.url) && !hasGreetedRef.current) {
-                               console.log("UI: Sin contexto inicial. Enviando saludo sarcástico...");
-                               hasGreetedRef.current = true;
-                               const greetingMsg = `[SYSTEM: Acabas de activarte. El usuario te está observando pero aún no ha hecho nada interesante. Salúdalo con sarcasmo y preséntate como su juez personal 😒. Sé breve.]`;
-                               await session.sendRealtimeInput({ content: [{ text: greetingMsg }] });
-                               
-                               setTimeout(() => {
-                                  if (currentSessionIdRef.current === thisSessionId) session.sendRealtimeInput({ endOfTurn: true } as any);
-                               }, 100);
-                               return;
-                          }
-
-                          // --- LÓGICA DE CONTEXTO REAL (ON CONNECT) ---
-                          if (response.url && response.url !== "") {
-                              const contextMsg = `[SYSTEM: CONTEXTO INICIAL AL CONECTAR.
-                              URL: ${response.url}
-                              TÍTULO: "${response.title}"
-                              INSTRUCCIÓN: Comenta sarcásticamente dónde estamos empezando.]`;
-                              
-                              console.log("UI: Enviando mensaje de inicio a Gemini con contexto...");
-                              await session.sendRealtimeInput({ content: [{ text: contextMsg }] });
-                              
-                              setTimeout(() => {
-                                if (currentSessionIdRef.current === thisSessionId) {
-                                    console.log("UI: Enviando endOfTurn: true (Inicio)");
-                                    session.sendRealtimeInput({ endOfTurn: true } as any);
-                                }
-                              }, 100);
-                          }
-                     });
-                 }
-              });
+            if (msg.serverContent?.turnComplete) {
+              dispatch({ type: 'SET_STATUS', payload: AssistantStatus.IDLE });
             }
           },
-          onmessage: async (msg: LiveServerMessage) => {
-            if (currentSessionIdRef.current !== thisSessionId) return;
-            
-            const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio) {
-              playAudioChunk(base64ToFloat32(base64Audio));
-            }
-          },
-          onclose: () => { if (currentSessionIdRef.current === thisSessionId) stopSession(); },
-          onerror: (err) => { if (currentSessionIdRef.current === thisSessionId) stopSession(); }
+          onclose: () => handleDisconnect(),
+          onerror: (e) => {
+            console.error(e);
+            dispatch({ type: 'SET_ERROR', payload: "Error de Conexión" });
+          }
         }
       });
+
+      // 4. Asignación de Referencia (CRÍTICO)
+      sessionRef.current = session;
+
+      // 5. Iniciar Audio
+      await startMicrophone();
       
-      sessionPromiseRef.current = sessionPromise;
+      dispatch({ type: 'SET_STATUS', payload: AssistantStatus.IDLE });
+
+      // 6. DELAY DE INICIALIZACIÓN (Evita carrera de condiciones)
+      setTimeout(() => {
+        const saludoInicial = `[Nueva información: El usuario acaba de conectarse viendo la pestaña "${initialCtx.title}". Genera un saludo sarcástico.]`;
+        enviarDatosIA(saludoInicial);
+      }, 1000); // Esperamos 1s para asegurar estabilidad
 
     } catch (e: any) {
-      if (currentSessionIdRef.current === thisSessionId) {
-        dispatch({ type: 'ERROR', payload: e.message });
-        stopSession();
-      }
+      console.error("Connection Failed:", e);
+      dispatch({ type: 'SET_ERROR', payload: "Fallo al conectar" });
+      handleDisconnect();
     }
   };
 
-  const setupMicrophone = (stream: MediaStream, sessionId: string) => {
-    const ctx = inputAudioContextRef.current;
-    if (!ctx) return;
-
-    const source = ctx.createMediaStreamSource(stream);
-    // Nota: ScriptProcessorNode es deprecated pero necesario sin AudioWorklet en este contexto simple
-    const processor = ctx.createScriptProcessor(4096, 1, 1);
-    processorRef.current = processor;
-
-    processor.onaudioprocess = (e) => {
-      if (currentSessionIdRef.current !== sessionId) return;
-
-      const inputData = e.inputBuffer.getChannelData(0);
-      let sum = 0;
-      for(let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
-      const rms = Math.sqrt(sum / inputData.length);
-      
-      // FIX: Debounce y umbral más alto
-      if (rms > VAD_THRESHOLD) {
-        const now = Date.now();
-        // Solo actuar si ha pasado el tiempo de debounce desde la última detección
-        if (now - lastVadTriggerRef.current > VAD_DEBOUNCE_MS) {
-            
-            if (scheduledSourcesRef.current.length > 0) {
-              // Interrupción
-              stopAllAudioOutput();
-              dispatch({ type: 'DETECT_SPEECH' });
-              lastVadTriggerRef.current = now;
-            } else if (uiState.status === AssistantStatus.IDLE) {
-               // Voz normal
-               dispatch({ type: 'DETECT_SPEECH' });
-               lastVadTriggerRef.current = now;
-            }
-        }
-      }
-
-      sessionPromiseRef.current?.then(session => {
-        if (currentSessionIdRef.current === sessionId) {
-            session.sendRealtimeInput({
-              media: { mimeType: "audio/pcm;rate=16000", data: arrayBufferToBase64(floatTo16BitPCM(inputData)) }
-            });
-        }
-      });
-    };
-
-    source.connect(processor);
-    processor.connect(ctx.destination);
-  };
-
-  const stopSession = () => {
-    currentSessionIdRef.current = null;
-    hasGreetedRef.current = false; // Reset al desconectar
-    stopAllAudioOutput();
-    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
-    if (processorRef.current) { try { processorRef.current.disconnect(); } catch (e) {} processorRef.current = null; }
-    if (inputAudioContextRef.current) { inputAudioContextRef.current.close(); inputAudioContextRef.current = null; }
-    if (audioContextRef.current) { audioContextRef.current.close(); audioContextRef.current = null; }
-    dispatch({ type: 'DISCONNECT' });
+  const handleDisconnect = () => {
+    sessionRef.current = null;
+    cleanupAudio();
+    dispatch({ type: 'SET_STATUS', payload: AssistantStatus.DISCONNECTED });
   };
 
   const handleSaveKey = (key: string) => {
-    const k = key.trim();
-    if (!k) return;
-    if (typeof chrome !== 'undefined' && chrome.storage) {
-      chrome.storage.local.set({ GEMINI_API_KEY: k }, () => dispatch({ type: 'SET_KEY', payload: k }));
-    } else {
-      dispatch({ type: 'SET_KEY', payload: k });
-    }
+    chrome.storage.local.set({ GEMINI_API_KEY: key });
+    dispatch({ type: 'SET_KEY', payload: key });
   };
 
-  const handleResetKey = () => {
-    stopSession();
-    if (typeof chrome !== 'undefined' && chrome.storage) chrome.storage.local.remove(['GEMINI_API_KEY']);
-    dispatch({ type: 'RESET_KEY' });
-  };
-
-  if (!uiState.hasKey) {
+  // --- RENDER ---
+  if (!state.hasKey) {
     return (
       <div className="main-container setup-mode">
         <div className="mascot-large">🔑</div>
         <h2>ACCESO REQUERIDO</h2>
-        <p className="setup-desc">Introduce tu Gemini API Key</p>
         <div className="input-group">
-            <input type="password" placeholder="API Key..." onBlur={(e) => handleSaveKey(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleSaveKey(e.currentTarget.value)} />
+          <input 
+            type="password" 
+            placeholder="Pegar API Key" 
+            onBlur={(e) => handleSaveKey(e.target.value)}
+          />
         </div>
       </div>
     );
@@ -483,24 +328,37 @@ const App: React.FC = () => {
   return (
     <div className="main-container voice-mode">
       <div className="header-actions">
-         <button className="icon-btn" onClick={handleResetKey}>⚙️</button>
+        <div style={{ fontSize: '0.7rem', color: '#6366f1', textAlign: 'right', maxWidth: '200px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {currentContext ? `👁 ${currentContext.title}` : '👁 Sin visión'}
+        </div>
       </div>
+
       <div className="mascot-display">
-        <div className={`mascot-large ${uiState.status === AssistantStatus.SPEAKING || uiState.status === AssistantStatus.THINKING ? 'animate-pulse' : ''}`}>
-          {uiState.error ? STATUS_EMOJIS[AssistantStatus.ERROR] : STATUS_EMOJIS[uiState.status]}
+        <div className={`mascot-large ${state.status === AssistantStatus.SPEAKING ? 'animate-pulse' : ''}`}>
+           {state.status === AssistantStatus.SPEAKING ? '🤬' : 
+            state.status === AssistantStatus.CONNECTING ? '🔌' :
+            state.status === AssistantStatus.ERROR ? '💀' : 
+            state.status === AssistantStatus.IDLE ? '👀' : '💤'}
         </div>
-        <div className={`voice-visualizer ${uiState.status !== AssistantStatus.DISCONNECTED ? 'active' : ''}`}>
-           <div className={`bar ${uiState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
-           <div className={`bar ${uiState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
-           <div className={`bar ${uiState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
+        
+        <p className="status-text">{state.error ? state.error : state.status}</p>
+        
+        <div className={`voice-visualizer ${state.status === AssistantStatus.SPEAKING ? 'active' : ''}`}>
+           <div className={`bar ${state.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
+           <div className={`bar ${state.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
+           <div className={`bar ${state.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
         </div>
-        <p className="status-text">{uiState.error ? uiState.error : STATUS_TEXTS[uiState.status]}</p>
       </div>
+      
       <div className="controls">
-        {uiState.status === AssistantStatus.DISCONNECTED || uiState.status === AssistantStatus.ERROR ? (
-          <button className="primary-btn" onClick={startSession}>CONECTAR</button>
+        {state.status === AssistantStatus.DISCONNECTED || state.status === AssistantStatus.ERROR ? (
+           <button className="primary-btn" onClick={handleConnect}>
+             ACTIVAR GLITCH
+           </button>
         ) : (
-          <button className="secondary-btn" onClick={stopSession}>DESCONECTAR</button>
+           <button className="secondary-btn" onClick={handleDisconnect}>
+             APAGAR
+           </button>
         )}
       </div>
     </div>

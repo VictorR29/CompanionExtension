@@ -1,80 +1,128 @@
-
 import { MessageType, AppMessage, ContextPayload } from './types';
 
 declare const chrome: any;
 
-let assistantWindowId: number | null = null;
-// MEMORIA: Guardamos el último contexto recibido (variable 'i' en tu descripción conceptual)
-let lastContext: ContextPayload | null = null;
-let hasLoggedFirstContext = false;
+// ESTADO GLOBAL EN MEMORIA
+let ultimoContexto: ContextPayload = {
+  url: '',
+  title: 'Nada',
+  description: 'El usuario mira al vacío.',
+  timestamp: 0
+};
 
-// Listener principal
-chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResponse: any) => {
-  
-  // 1. Handshake / Status check
-  if (message.type === MessageType.GET_STATUS) {
-      sendResponse({ 
-        isActive: true,
-        context: lastContext 
-      });
-  }
+// --- HELPERS ---
 
-  // 2. Solicitud explícita de la UI (Pull) - CRÍTICO PARA EL INICIO
-  if (message.type === MessageType.REQUEST_LATEST_CONTEXT) {
-      // FIX: Si es null, enviamos un objeto vacío explícito para evitar crashes en UI
-      const safeContext = lastContext || { 
-        event: 'NO_CONTEXT', 
-        url: '', 
-        title: '', 
-        timestamp: Date.now() 
-      };
-      
-      console.log("Background: UI solicitó último contexto. Enviando:", safeContext);
-      sendResponse(safeContext);
-  }
+/**
+ * Obtiene la pestaña activa real, ignorando la ventana de la extensión.
+ */
+async function getActiveTabInfo(): Promise<ContextPayload> {
+  try {
+    // 1. Obtener todas las ventanas normales (no popups ni paneles)
+    const windows = await chrome.windows.getAll({ populate: true, windowTypes: ['normal'] });
+    
+    // 2. Buscar la pestaña activa en la ventana que tiene el foco (o la última que lo tuvo)
+    let activeTab = null;
+    
+    // Primero intentar con la última ventana enfocada
+    const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }).catch(() => null);
+    if (lastFocused && lastFocused.tabs) {
+      activeTab = lastFocused.tabs.find((t: any) => t.active);
+    }
 
-  // 3. CONTEXT HUB: Recibir actualización del Content Script
-  if (message.type === MessageType.CONTEXT_UPDATE) {
-    // A. Guardar en memoria (Persistencia de sesión)
-    if (message.payload) {
-      lastContext = message.payload;
-      
-      if (!hasLoggedFirstContext && message.payload.event !== 'NO_CONTEXT') {
-        console.log("Background: Primer contexto real recibido 🟢", lastContext);
-        hasLoggedFirstContext = true;
-      } else {
-        console.log("Background: Contexto actualizado en memoria:", lastContext);
+    // Si no, buscar en cualquiera
+    if (!activeTab) {
+      for (const win of windows) {
+        const tab = win.tabs?.find((t: any) => t.active);
+        if (tab) {
+          activeTab = tab;
+          break;
+        }
       }
     }
 
-    // B. Reenviar a la UI (App.tsx) con DELAY
-    // El delay ayuda a prevenir condiciones de carrera si la UI está ocupada renderizando
-    setTimeout(() => {
-        chrome.runtime.sendMessage(message).catch(() => {
-          // Ignoramos error si la ventana no está abierta
-        });
-    }, 200);
+    if (activeTab && activeTab.url && !activeTab.url.startsWith('chrome-extension://')) {
+      const realContext: ContextPayload = {
+        url: activeTab.url,
+        title: activeTab.title || 'Sitio sin nombre',
+        description: 'Navegando activamente',
+        timestamp: Date.now()
+      };
+      
+      ultimoContexto = realContext;
+      return realContext;
+    }
+  } catch (e) {
+    console.error("Error obteniendo tab:", e);
+  }
+  return ultimoContexto;
+}
+
+/**
+ * Envía el contexto actualizado a la UI (Popup) si está abierta.
+ */
+async function broadcastContextUpdate() {
+  const ctx = await getActiveTabInfo();
+  try {
+    // Enviamos mensaje a la runtime. Si el popup está cerrado, esto fallará silenciosamente.
+    await chrome.runtime.sendMessage({
+      type: MessageType.CONTEXT_UPDATED,
+      payload: ctx
+    });
+  } catch (e) {
+    // Es normal que falle si la UI no está abierta
+  }
+}
+
+// --- LISTENERS ---
+
+// 1. Cambio de Pestaña activa
+chrome.tabs.onActivated.addListener(() => {
+  broadcastContextUpdate();
+});
+
+// 2. Actualización de URL/Carga en la misma pestaña
+chrome.tabs.onUpdated.addListener((tabId: number, changeInfo: any, tab: any) => {
+  if (changeInfo.status === 'complete' && tab.active) {
+    broadcastContextUpdate();
+  }
+});
+
+// 3. Cambio de foco de ventana
+chrome.windows.onFocusChanged.addListener((windowId: number) => {
+  if (windowId !== chrome.windows.WINDOW_ID_NONE) {
+    broadcastContextUpdate();
+  }
+});
+
+// 4. Comunicación con la UI (React)
+chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResponse: any) => {
+  
+  // Solicitud sincrónica del contexto inicial al abrir el popup
+  if (message.type === MessageType.GET_LAST_CONTEXT) {
+    getActiveTabInfo().then((ctx) => {
+      sendResponse(ctx);
+    });
+    return true; // Indica respuesta asíncrona
   }
 
-  return true; // Mantiene el canal de respuesta abierto para async (necesario para sendResponse)
-});
-
-// Gestión de ventanas
-chrome.action.onClicked.addListener(() => {
-  openAssistantWindow();
-});
-
-chrome.windows.onRemoved.addListener((windowId: number) => {
-  if (windowId === assistantWindowId) {
-    assistantWindowId = null;
+  // Recepción de actividad desde content scripts
+  if (message.type === MessageType.BROWSER_ACTIVITY) {
+    const payload = message.payload as ContextPayload;
+    if (payload.url && !payload.url.startsWith('chrome-extension://')) {
+      ultimoContexto = payload;
+      broadcastContextUpdate();
+    }
   }
 });
 
-async function openAssistantWindow() {
+// 5. Gestión de Ventana Popup
+let assistantWindowId: number | null = null;
+
+chrome.action.onClicked.addListener(async () => {
   if (assistantWindowId !== null) {
     try {
       await chrome.windows.get(assistantWindowId);
-      chrome.windows.update(assistantWindowId, { focused: true });
+      await chrome.windows.update(assistantWindowId, { focused: true });
       return;
     } catch (e) {
       assistantWindowId = null;
@@ -84,22 +132,16 @@ async function openAssistantWindow() {
   const win = await chrome.windows.create({
     url: chrome.runtime.getURL('index.html'),
     type: 'popup',
-    width: 350,
-    height: 550,
+    width: 360,
+    height: 600,
     focused: true
   });
   
   assistantWindowId = win.id || null;
+});
 
-  // C. Inyección retardada al abrir
-  // Esperamos a que React cargue (1s) y enviamos el contexto proactivamente
-  if (lastContext) {
-      console.log("Background: Programando envío de contexto inicial a ventana nueva...");
-      setTimeout(() => {
-          chrome.runtime.sendMessage({
-              type: MessageType.CONTEXT_UPDATE,
-              payload: lastContext
-          }).catch(err => console.log("Fallo envío inicial (posiblemente UI no lista):", err));
-      }, 1000);
+chrome.windows.onRemoved.addListener((winId) => {
+  if (winId === assistantWindowId) {
+    assistantWindowId = null;
   }
-}
+});
