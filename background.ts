@@ -2,37 +2,35 @@ import { MessageType, AppMessage, ContextPayload } from './types';
 
 declare const chrome: any;
 
-// ESTADO GLOBAL EN MEMORIA
-let ultimoContexto: ContextPayload = {
+// --- ESTADO GLOBAL ---
+let currentContextState: ContextPayload = {
   url: '',
   title: 'Nada',
   description: 'El usuario mira al vacío.',
   timestamp: 0
 };
 
-// --- HELPERS ---
+// --- HELPERS DE NAVEGACIÓN ---
 
 /**
- * Obtiene la pestaña activa real, ignorando la ventana de la extensión.
+ * Obtiene la información de la pestaña activa ignorando la ventana de la extensión.
  */
-async function getActiveTabInfo(): Promise<ContextPayload> {
+async function retrieveActiveTabInfo(): Promise<ContextPayload> {
   try {
-    // 1. Obtener todas las ventanas normales (no popups ni paneles)
     const windows = await chrome.windows.getAll({ populate: true, windowTypes: ['normal'] });
     
-    // 2. Buscar la pestaña activa en la ventana que tiene el foco (o la última que lo tuvo)
     let activeTab = null;
     
-    // Primero intentar con la última ventana enfocada
-    const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }).catch(() => null);
-    if (lastFocused && lastFocused.tabs) {
-      activeTab = lastFocused.tabs.find((t: any) => t.active);
+    // 1. Intentar obtener de la última ventana enfocada
+    const lastFocusedWindow = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }).catch(() => null);
+    if (lastFocusedWindow && lastFocusedWindow.tabs) {
+      activeTab = lastFocusedWindow.tabs.find((t: any) => t.active);
     }
 
-    // Si no, buscar en cualquiera
+    // 2. Fallback: buscar en cualquier ventana
     if (!activeTab) {
-      for (const win of windows) {
-        const tab = win.tabs?.find((t: any) => t.active);
+      for (const windowItem of windows) {
+        const tab = windowItem.tabs?.find((t: any) => t.active);
         if (tab) {
           activeTab = tab;
           break;
@@ -41,95 +39,95 @@ async function getActiveTabInfo(): Promise<ContextPayload> {
     }
 
     if (activeTab && activeTab.url && !activeTab.url.startsWith('chrome-extension://')) {
-      const realContext: ContextPayload = {
+      const freshContext: ContextPayload = {
         url: activeTab.url,
         title: activeTab.title || 'Sitio sin nombre',
         description: 'Navegando activamente',
         timestamp: Date.now()
       };
       
-      ultimoContexto = realContext;
-      return realContext;
+      currentContextState = freshContext;
+      return freshContext;
     }
-  } catch (e) {
-    console.error("Error obteniendo tab:", e);
+  } catch (error) {
+    console.error("System Error: Failed to retrieve active tab:", error);
   }
-  return ultimoContexto;
+  return currentContextState;
 }
 
 /**
- * Envía el contexto actualizado a la UI (Popup) si está abierta.
+ * Difunde el estado actual a la interfaz de usuario (Popup).
  */
-async function broadcastContextUpdate() {
-  const ctx = await getActiveTabInfo();
+async function broadcastSystemState() {
+  const context = await retrieveActiveTabInfo();
   try {
-    // Enviamos mensaje a la runtime. Si el popup está cerrado, esto fallará silenciosamente.
     await chrome.runtime.sendMessage({
       type: MessageType.CONTEXT_UPDATED,
-      payload: ctx
+      payload: context
     });
-  } catch (e) {
-    // Es normal que falle si la UI no está abierta
+  } catch (error) {
+    // La UI no está escuchando (popup cerrado), esto es esperado.
   }
 }
 
-// --- LISTENERS ---
+// --- EVENT LISTENERS ---
 
-// 1. Cambio de Pestaña activa
+// 1. Cambio de pestaña activa
 chrome.tabs.onActivated.addListener(() => {
-  broadcastContextUpdate();
+  broadcastSystemState();
 });
 
-// 2. Actualización de URL/Carga en la misma pestaña
+// 2. Actualización de contenido (carga completa)
 chrome.tabs.onUpdated.addListener((tabId: number, changeInfo: any, tab: any) => {
   if (changeInfo.status === 'complete' && tab.active) {
-    broadcastContextUpdate();
+    broadcastSystemState();
   }
 });
 
 // 3. Cambio de foco de ventana
 chrome.windows.onFocusChanged.addListener((windowId: number) => {
   if (windowId !== chrome.windows.WINDOW_ID_NONE) {
-    broadcastContextUpdate();
+    broadcastSystemState();
   }
 });
 
-// 4. Comunicación con la UI (React)
+// 4. Bus de mensajes (Comunicación UI <-> Background)
 chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResponse: any) => {
   
-  // Solicitud sincrónica del contexto inicial al abrir el popup
   if (message.type === MessageType.GET_LAST_CONTEXT) {
-    getActiveTabInfo().then((ctx) => {
-      sendResponse(ctx);
+    retrieveActiveTabInfo().then((context) => {
+      sendResponse(context);
     });
-    return true; // Indica respuesta asíncrona
+    return true; // Respuesta asíncrona
   }
 
-  // Recepción de actividad desde content scripts
   if (message.type === MessageType.BROWSER_ACTIVITY) {
     const payload = message.payload as ContextPayload;
+    // Solo actualizamos si es una URL válida y no interna
     if (payload.url && !payload.url.startsWith('chrome-extension://')) {
-      ultimoContexto = payload;
-      broadcastContextUpdate();
+      currentContextState = payload;
+      broadcastSystemState();
     }
   }
 });
 
-// 5. Gestión de Ventana Popup
+// 5. Gestión de Ventana (Singleton Pattern para el Popup)
 let assistantWindowId: number | null = null;
 
 chrome.action.onClicked.addListener(async () => {
   if (assistantWindowId !== null) {
     try {
+      // Verificar si la ventana realmente existe
       await chrome.windows.get(assistantWindowId);
       await chrome.windows.update(assistantWindowId, { focused: true });
       return;
-    } catch (e) {
+    } catch (error) {
+      // Si falla, el ID es inválido, reseteamos
       assistantWindowId = null;
     }
   }
 
-  const win = await chrome.windows.create({
+  const newWindow = await chrome.windows.create({
     url: chrome.runtime.getURL('index.html'),
     type: 'popup',
     width: 360,
@@ -137,11 +135,11 @@ chrome.action.onClicked.addListener(async () => {
     focused: true
   });
   
-  assistantWindowId = win.id || null;
+  assistantWindowId = newWindow.id || null;
 });
 
-chrome.windows.onRemoved.addListener((winId) => {
-  if (winId === assistantWindowId) {
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (windowId === assistantWindowId) {
     assistantWindowId = null;
   }
 });
