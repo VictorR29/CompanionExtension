@@ -1,11 +1,26 @@
-<div align="center">
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+# Sarcastic Assistant Chrome Extension
 
-  <h1>Built with AI Studio</h2>
+## 🚀 Instrucciones Críticas de Instalación
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+1.  **Instalar dependencias:**
+    `npm install`
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+2.  **Compilar el proyecto (Paso obligatorio):**
+    `npm run build`
+    Esto creará una carpeta llamada `dist/` en la raíz de tu proyecto. **Esta es la única carpeta que Chrome entiende.**
 
-</div>
+3.  **Cargar en Chrome:**
+    - Ve a `chrome://extensions/`.
+    - Activa el **Modo de desarrollador** (arriba a la derecha).
+    - Haz clic en **Cargar descomprimida** (Load unpacked).
+    - **IMPORTANTE:** Selecciona la carpeta `dist/` que se generó en el paso anterior, NO la carpeta raíz del código fuente.
+
+## 🛠 Estructura
+- `public/manifest.json`: El cerebro de la extensión. Se copia a `dist/` al compilar.
+- `background.ts`: El script que vive en las sombras y maneja la ventana flotante.
+- `contentScript.ts`: El espía que observa lo que haces en las webs.
+- `App.tsx`: La cara (sarcástica) de la IA.
+
+## ⚠️ Errores comunes
+Si Chrome dice "No se pudo cargar contentScript.js", es porque estás intentando cargar la carpeta raíz en lugar de la carpeta `dist/`. Ejecuta `npm run build` y selecciona `dist/`.

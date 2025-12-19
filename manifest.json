@@ -1,0 +1,33 @@
+
+{
+  "manifest_version": 3,
+  "name": "Sarcastic Mascot AI",
+  "version": "1.0.0",
+  "description": "Un asistente sarcástico que te juzga mientras navegas.",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "windows",
+    "storage"
+  ],
+  "action": {
+    "default_title": "Abrir Mascota Sarcástica"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["contentScript.js"]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["index.html", "assets/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

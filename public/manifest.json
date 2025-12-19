@@ -1,0 +1,33 @@
+
+{
+  "manifest_version": 3,
+  "name": "Sarcastic Mascot AI",
+  "version": "1.0.0",
+  "description": "An independent floating AI assistant that follows you across tabs.",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "windows",
+    "storage"
+  ],
+  "action": {
+    "default_title": "Open Sarcastic Mascot"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["contentScript.js"]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["index.html"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

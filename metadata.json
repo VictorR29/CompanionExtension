@@ -1,0 +1,8 @@
+{
+  "name": "Sarcastic AI Assistant Extension",
+  "description": "A sarcastic AI mascot that lives in a floating window and comments on your browsing behavior.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
