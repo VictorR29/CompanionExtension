@@ -4,7 +4,7 @@ import { MessageType, AppMessage, ContextPayload } from './types';
 declare const chrome: any;
 
 let assistantWindowId: number | null = null;
-// MEMORIA: Guardamos el último contexto recibido para cuando la ventana se abra
+// MEMORIA: Guardamos el último contexto recibido (variable 'i' en tu descripción conceptual)
 let lastContext: ContextPayload | null = null;
 
 // Listener principal
@@ -18,10 +18,18 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
       });
   }
 
-  // 2. Solicitud explícita de la UI (Pull)
+  // 2. Solicitud explícita de la UI (Pull) - CRÍTICO PARA EL INICIO
   if (message.type === MessageType.REQUEST_LATEST_CONTEXT) {
-      console.log("Background: UI solicitó último contexto", lastContext);
-      sendResponse(lastContext);
+      // FIX: Si es null, enviamos un objeto vacío explícito para evitar crashes en UI
+      const safeContext = lastContext || { 
+        event: 'NO_CONTEXT', 
+        url: '', 
+        title: '', 
+        timestamp: Date.now() 
+      };
+      
+      console.log("Background: UI solicitó último contexto. Enviando:", safeContext);
+      sendResponse(safeContext);
   }
 
   // 3. CONTEXT HUB: Recibir actualización del Content Script
@@ -29,19 +37,19 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
     // A. Guardar en memoria (Persistencia de sesión)
     if (message.payload) {
       lastContext = message.payload;
-      console.log("Background: Contexto actualizado y listo para envío", lastContext);
+      console.log("Background: Contexto actualizado en memoria:", lastContext);
     }
 
     // B. Reenviar a la UI (App.tsx) con DELAY
-    // Esperamos 200ms para asegurar que la UI esté lista o procesando frames previos
+    // El delay ayuda a prevenir condiciones de carrera si la UI está ocupada renderizando
     setTimeout(() => {
         chrome.runtime.sendMessage(message).catch(() => {
-          // Es normal que falle si la ventana de la IA está cerrada.
+          // Ignoramos error si la ventana no está abierta
         });
     }, 200);
   }
 
-  return true; // Mantiene el canal de respuesta abierto para async
+  return true; // Mantiene el canal de respuesta abierto para async (necesario para sendResponse)
 });
 
 // Gestión de ventanas
@@ -77,13 +85,14 @@ async function openAssistantWindow() {
   assistantWindowId = win.id || null;
 
   // C. Inyección retardada al abrir
-  // Si tenemos contexto, lo enviamos proactivamente después de que la ventana cargue
+  // Esperamos a que React cargue (1s) y enviamos el contexto proactivamente
   if (lastContext) {
+      console.log("Background: Programando envío de contexto inicial a ventana nueva...");
       setTimeout(() => {
           chrome.runtime.sendMessage({
               type: MessageType.CONTEXT_UPDATE,
               payload: lastContext
-          }).catch(err => console.log("Fallo envío inicial:", err));
+          }).catch(err => console.log("Fallo envío inicial (posiblemente UI no lista):", err));
       }, 1000);
   }
 }

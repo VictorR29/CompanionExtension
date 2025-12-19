@@ -8,7 +8,11 @@ declare const chrome: any;
 // --- CONSTANTES ---
 const AUDIO_CTX_SAMPLE_RATE = 24000;
 const INPUT_SAMPLE_RATE = 16000;
-const VAD_THRESHOLD = 0.02;
+
+// FIX: Aumentado threshold para evitar ruido fantasma y loops
+const VAD_THRESHOLD = 0.05; 
+const VAD_DEBOUNCE_MS = 500; // Nuevo: Tiempo mínimo entre detecciones
+
 // COOLDOWN: 3 segundos para reactividad alta
 const AI_COOLDOWN_MS = 3000; 
 
@@ -73,6 +77,9 @@ const App: React.FC = () => {
   const scheduledSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const currentSessionIdRef = useRef<string | null>(null);
   const lastAiSpeechTimeRef = useRef<number>(0);
+  
+  // Anti-loop refs
+  const lastVadTriggerRef = useRef<number>(0);
 
   // --- API KEY ---
   useEffect(() => {
@@ -88,13 +95,12 @@ const App: React.FC = () => {
     if (typeof chrome === 'undefined' || !chrome.runtime) return;
 
     const handleMessage = (message: any) => {
-      console.log("UI: Mensaje recibido", message);
+      // console.log("UI: Mensaje recibido", message); // Descomentar para debug intenso
       
       if (message.type !== MessageType.CONTEXT_UPDATE) return;
       
       // Si no tenemos sesión, no hacemos nada (pero el mensaje llegó)
       if (!currentSessionIdRef.current || !sessionPromiseRef.current) {
-        console.warn("UI: Contexto recibido pero sesión no iniciada.");
         return;
       }
 
@@ -102,16 +108,22 @@ const App: React.FC = () => {
       
       // 1. NO INTERRUMPIR: Si hay audio activo, ignorar actualizaciones
       if (uiState.status === AssistantStatus.SPEAKING || uiState.status === AssistantStatus.LISTENING) {
-          console.log("UI: Ignorando contexto por estado activo:", uiState.status);
           return;
       }
 
       const payload = message.payload as ContextPayload;
+      
+      // FIX: Validación de payload nulo o vacío
+      if (!payload || !payload.url || payload.event === 'NO_CONTEXT') {
+        console.log("UI: Contexto recibido es null o inválido, ignorando.");
+        return;
+      }
+
       const now = Date.now();
 
       // 2. COOLDOWN
       if (now - lastAiSpeechTimeRef.current < AI_COOLDOWN_MS) {
-          console.log("UI: Cooldown activo");
+          console.log("UI: Cooldown activo, ignorando evento");
           return;
       }
 
@@ -122,24 +134,29 @@ const App: React.FC = () => {
           
           // --- ESTRATEGIA: TRIGGER DE SISTEMA AUTÓNOMO ---
           
-          const contextMsg = `[SYSTEM: El usuario ha generado un evento de tipo ${payload.event}.
-          URL Actual: ${payload.url}
-          Título: "${payload.title}"
-          ${payload.selection ? `Selección del usuario: "${payload.selection}"` : ''}
+          const contextMsg = `[SYSTEM: EVENTO DETECTADO.
+          TIPO: ${payload.event}
+          URL: ${payload.url}
+          TÍTULO: "${payload.title}"
+          ${payload.selection ? `SELECCIÓN: "${payload.selection}"` : ''}
           INSTRUCCIÓN: Reacciona ahora con audio sarcástico sobre esto.]`;
 
           // A. Enviamos el contexto
-          await session.sendRealtimeInput({
-            content: [{ text: contextMsg }]
-          });
+          try {
+            await session.sendRealtimeInput({
+              content: [{ text: contextMsg }]
+            });
 
-          // B. TRIGGER EXPLICITO: Forzamos el cierre de turno inmediatamente.
-          setTimeout(() => {
-             if (currentSessionIdRef.current) {
-                console.log("UI: Enviando endOfTurn: true");
-                session.sendRealtimeInput({ endOfTurn: true } as any);
-             }
-          }, 100); 
+            // B. TRIGGER EXPLICITO: Forzamos el cierre de turno inmediatamente.
+            setTimeout(() => {
+               if (currentSessionIdRef.current) {
+                  console.log("UI: Enviando endOfTurn: true (Evento)");
+                  session.sendRealtimeInput({ endOfTurn: true } as any);
+               }
+            }, 100); 
+          } catch (e) {
+            console.error("UI: Error enviando contexto a Gemini", e);
+          }
         }
       });
     };
@@ -198,8 +215,19 @@ const App: React.FC = () => {
 
   const playAudioChunk = (float32Data: Float32Array) => {
     if (!audioContextRef.current) return;
-    const ctx = audioContextRef.current;
+    
+    // FIX: Prevenir loops infinitos si el modelo manda audio vacío
+    if (!float32Data || float32Data.length === 0) {
+      console.log("UI: Chunk de audio vacío recibido. Ignorando.");
+      // Si el estado es SPEAKING pero el audio es vacío, necesitamos terminar el estado
+      // para no quedarnos trabados en "Speaking..."
+      dispatch({ type: 'MODEL_AUDIO_END' });
+      return;
+    }
 
+    console.log(`UI: Iniciando audio chunk de longitud ${float32Data.length}`);
+
+    const ctx = audioContextRef.current;
     const audioBuffer = ctx.createBuffer(1, float32Data.length, AUDIO_CTX_SAMPLE_RATE);
     audioBuffer.getChannelData(0).set(float32Data);
 
@@ -266,31 +294,46 @@ const App: React.FC = () => {
         callbacks: {
           onopen: () => {
             if (currentSessionIdRef.current !== thisSessionId) return;
+            
+            console.log("UI: Conexión establecida. Iniciando setup...");
             dispatch({ type: 'CONNECTION_ESTABLISHED' });
             setupMicrophone(stream, thisSessionId);
 
             // --- PULL CONTEXT: Solicitar estado actual al background ---
             if (typeof chrome !== 'undefined' && chrome.runtime) {
-              chrome.runtime.sendMessage({ type: MessageType.REQUEST_LATEST_CONTEXT }, (response: ContextPayload | null) => {
-                 if (response && currentSessionIdRef.current === thisSessionId) {
-                    console.log("UI: Contexto inicial recibido del Background", response);
-                    // Forzamos el procesamiento como si fuera un evento nuevo
-                    // Usamos un pequeño delay para no saturar el inicio de sesión
-                    setTimeout(() => {
-                        const fakeMessage = { type: MessageType.CONTEXT_UPDATE, payload: response };
-                        // Disparamos manualmente el handler o reenviamos localmente
-                        // Como el handler usa listeners de chrome, lo más fácil es simular el mensaje localmente
-                        // Pero mejor: lógica duplicada directa aquí para seguridad
-                         sessionPromise.then(async (session) => {
-                              const contextMsg = `[SYSTEM: CONTEXTO INICIAL AL CONECTAR.
-                              URL: ${response.url}
-                              Título: "${response.title}"
-                              INSTRUCCIÓN: Comenta sarcásticamente dónde estamos empezando.]`;
-                              
-                              await session.sendRealtimeInput({ content: [{ text: contextMsg }] });
-                              setTimeout(() => session.sendRealtimeInput({ endOfTurn: true } as any), 100);
-                         });
-                    }, 500);
+              console.log("UI: Solicitando contexto inicial al Background...");
+              chrome.runtime.sendMessage({ type: MessageType.REQUEST_LATEST_CONTEXT }, (response: any) => {
+                 
+                 // Comprobamos error de runtime
+                 if (chrome.runtime.lastError) {
+                    console.warn("UI: Error solicitando contexto:", chrome.runtime.lastError);
+                    return;
+                 }
+
+                 // FIX: Verificar si es un contexto válido o el dummy NO_CONTEXT
+                 if (response && response.event !== 'NO_CONTEXT' && response.url && currentSessionIdRef.current === thisSessionId) {
+                    console.log("UI: Contexto inicial recibido del Background:", response);
+                    
+                    sessionPromise.then(async (session) => {
+                          const contextMsg = `[SYSTEM: CONTEXTO INICIAL AL CONECTAR.
+                          URL: ${response.url}
+                          TÍTULO: "${response.title}"
+                          INSTRUCCIÓN: Comenta sarcásticamente dónde estamos empezando.]`;
+                          
+                          console.log("UI: Enviando mensaje de inicio a Gemini...");
+                          await session.sendRealtimeInput({ content: [{ text: contextMsg }] });
+                          
+                          // TRIGGER INMEDIATO
+                          setTimeout(() => {
+                             if (currentSessionIdRef.current === thisSessionId) {
+                                console.log("UI: Enviando endOfTurn: true (Inicio)");
+                                session.sendRealtimeInput({ endOfTurn: true } as any);
+                             }
+                          }, 100);
+                     });
+                 } else {
+                     console.log("UI: Contexto inicial vacío (NO_CONTEXT) o inválido. Manteniendo silencio.");
+                     // No enviamos nada a Gemini, se queda en IDLE esperando nuevos eventos.
                  }
               });
             }
@@ -323,6 +366,7 @@ const App: React.FC = () => {
     if (!ctx) return;
 
     const source = ctx.createMediaStreamSource(stream);
+    // Nota: ScriptProcessorNode es deprecated pero necesario sin AudioWorklet en este contexto simple
     const processor = ctx.createScriptProcessor(4096, 1, 1);
     processorRef.current = processor;
 
@@ -332,13 +376,24 @@ const App: React.FC = () => {
       const inputData = e.inputBuffer.getChannelData(0);
       let sum = 0;
       for(let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
+      const rms = Math.sqrt(sum / inputData.length);
       
-      if (Math.sqrt(sum / inputData.length) > VAD_THRESHOLD) {
-        if (scheduledSourcesRef.current.length > 0) {
-          stopAllAudioOutput();
-          dispatch({ type: 'DETECT_SPEECH' });
-        } else if (uiState.status === AssistantStatus.IDLE) {
-           dispatch({ type: 'DETECT_SPEECH' });
+      // FIX: Debounce y umbral más alto
+      if (rms > VAD_THRESHOLD) {
+        const now = Date.now();
+        // Solo actuar si ha pasado el tiempo de debounce desde la última detección
+        if (now - lastVadTriggerRef.current > VAD_DEBOUNCE_MS) {
+            
+            if (scheduledSourcesRef.current.length > 0) {
+              // Interrupción
+              stopAllAudioOutput();
+              dispatch({ type: 'DETECT_SPEECH' });
+              lastVadTriggerRef.current = now;
+            } else if (uiState.status === AssistantStatus.IDLE) {
+               // Voz normal
+               dispatch({ type: 'DETECT_SPEECH' });
+               lastVadTriggerRef.current = now;
+            }
         }
       }
 

@@ -22,7 +22,7 @@ export interface AssistantState {
 }
 
 export interface ContextPayload {
-  event: 'NAVIGATION' | 'SELECTION' | 'VISIBILITY_VISIBLE' | 'VISIBILITY_HIDDEN' | 'SCROLL';
+  event: 'NAVIGATION' | 'SELECTION' | 'VISIBILITY_VISIBLE' | 'VISIBILITY_HIDDEN' | 'SCROLL' | 'NO_CONTEXT';
   url: string;
   title: string;
   selection?: string;
