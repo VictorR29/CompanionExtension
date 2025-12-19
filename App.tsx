@@ -88,18 +88,34 @@ const App: React.FC = () => {
     if (typeof chrome === 'undefined' || !chrome.runtime) return;
 
     const handleMessage = (message: any) => {
+      console.log("UI: Mensaje recibido", message);
+      
       if (message.type !== MessageType.CONTEXT_UPDATE) return;
-      if (!currentSessionIdRef.current || !sessionPromiseRef.current) return;
+      
+      // Si no tenemos sesión, no hacemos nada (pero el mensaje llegó)
+      if (!currentSessionIdRef.current || !sessionPromiseRef.current) {
+        console.warn("UI: Contexto recibido pero sesión no iniciada.");
+        return;
+      }
+
       if (uiState.status === AssistantStatus.ERROR || uiState.status === AssistantStatus.DISCONNECTED) return;
       
       // 1. NO INTERRUMPIR: Si hay audio activo, ignorar actualizaciones
-      if (uiState.status === AssistantStatus.SPEAKING || uiState.status === AssistantStatus.LISTENING) return;
+      if (uiState.status === AssistantStatus.SPEAKING || uiState.status === AssistantStatus.LISTENING) {
+          console.log("UI: Ignorando contexto por estado activo:", uiState.status);
+          return;
+      }
 
       const payload = message.payload as ContextPayload;
       const now = Date.now();
 
       // 2. COOLDOWN
-      if (now - lastAiSpeechTimeRef.current < AI_COOLDOWN_MS) return;
+      if (now - lastAiSpeechTimeRef.current < AI_COOLDOWN_MS) {
+          console.log("UI: Cooldown activo");
+          return;
+      }
+
+      console.log("UI: Procesando contexto para Gemini...", payload);
 
       sessionPromiseRef.current.then(async (session) => {
         if (currentSessionIdRef.current) {
@@ -118,10 +134,9 @@ const App: React.FC = () => {
           });
 
           // B. TRIGGER EXPLICITO: Forzamos el cierre de turno inmediatamente.
-          // Esto obliga al modelo a procesar el texto anterior y generar audio.
           setTimeout(() => {
              if (currentSessionIdRef.current) {
-                // "endOfTurn: true" no está tipado en el SDK estándar pero es soportado por el protocolo Live
+                console.log("UI: Enviando endOfTurn: true");
                 session.sendRealtimeInput({ endOfTurn: true } as any);
              }
           }, 100); 
@@ -253,6 +268,32 @@ const App: React.FC = () => {
             if (currentSessionIdRef.current !== thisSessionId) return;
             dispatch({ type: 'CONNECTION_ESTABLISHED' });
             setupMicrophone(stream, thisSessionId);
+
+            // --- PULL CONTEXT: Solicitar estado actual al background ---
+            if (typeof chrome !== 'undefined' && chrome.runtime) {
+              chrome.runtime.sendMessage({ type: MessageType.REQUEST_LATEST_CONTEXT }, (response: ContextPayload | null) => {
+                 if (response && currentSessionIdRef.current === thisSessionId) {
+                    console.log("UI: Contexto inicial recibido del Background", response);
+                    // Forzamos el procesamiento como si fuera un evento nuevo
+                    // Usamos un pequeño delay para no saturar el inicio de sesión
+                    setTimeout(() => {
+                        const fakeMessage = { type: MessageType.CONTEXT_UPDATE, payload: response };
+                        // Disparamos manualmente el handler o reenviamos localmente
+                        // Como el handler usa listeners de chrome, lo más fácil es simular el mensaje localmente
+                        // Pero mejor: lógica duplicada directa aquí para seguridad
+                         sessionPromise.then(async (session) => {
+                              const contextMsg = `[SYSTEM: CONTEXTO INICIAL AL CONECTAR.
+                              URL: ${response.url}
+                              Título: "${response.title}"
+                              INSTRUCCIÓN: Comenta sarcásticamente dónde estamos empezando.]`;
+                              
+                              await session.sendRealtimeInput({ content: [{ text: contextMsg }] });
+                              setTimeout(() => session.sendRealtimeInput({ endOfTurn: true } as any), 100);
+                         });
+                    }, 500);
+                 }
+              });
+            }
           },
           onmessage: async (msg: LiveServerMessage) => {
             if (currentSessionIdRef.current !== thisSessionId) return;

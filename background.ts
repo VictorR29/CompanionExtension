@@ -12,26 +12,33 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
   
   // 1. Handshake / Status check
   if (message.type === MessageType.GET_STATUS) {
-      // Devolvemos el estado Y el último contexto conocido (Sync on load)
       sendResponse({ 
         isActive: true,
         context: lastContext 
       });
   }
 
-  // 2. CONTEXT HUB: Recibir actualización del Content Script
+  // 2. Solicitud explícita de la UI (Pull)
+  if (message.type === MessageType.REQUEST_LATEST_CONTEXT) {
+      console.log("Background: UI solicitó último contexto", lastContext);
+      sendResponse(lastContext);
+  }
+
+  // 3. CONTEXT HUB: Recibir actualización del Content Script
   if (message.type === MessageType.CONTEXT_UPDATE) {
     // A. Guardar en memoria (Persistencia de sesión)
     if (message.payload) {
       lastContext = message.payload;
+      console.log("Background: Contexto actualizado y listo para envío", lastContext);
     }
 
-    // B. Reenviar a la UI (App.tsx) si está abierta
-    // chrome.runtime.sendMessage hace broadcast a todas las vistas de la extensión (popup/windows)
-    chrome.runtime.sendMessage(message).catch(() => {
-      // Es normal que falle si la ventana de la IA está cerrada.
-      // No hacemos nada porque ya guardamos el dato en 'lastContext'.
-    });
+    // B. Reenviar a la UI (App.tsx) con DELAY
+    // Esperamos 200ms para asegurar que la UI esté lista o procesando frames previos
+    setTimeout(() => {
+        chrome.runtime.sendMessage(message).catch(() => {
+          // Es normal que falle si la ventana de la IA está cerrada.
+        });
+    }, 200);
   }
 
   return true; // Mantiene el canal de respuesta abierto para async
@@ -68,4 +75,15 @@ async function openAssistantWindow() {
   });
   
   assistantWindowId = win.id || null;
+
+  // C. Inyección retardada al abrir
+  // Si tenemos contexto, lo enviamos proactivamente después de que la ventana cargue
+  if (lastContext) {
+      setTimeout(() => {
+          chrome.runtime.sendMessage({
+              type: MessageType.CONTEXT_UPDATE,
+              payload: lastContext
+          }).catch(err => console.log("Fallo envío inicial:", err));
+      }, 1000);
+  }
 }

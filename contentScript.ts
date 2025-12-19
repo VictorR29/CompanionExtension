@@ -34,6 +34,8 @@ function sendContextUpdate(event: 'NAVIGATION' | 'SELECTION' | 'VISIBILITY_VISIB
         timestamp: Date.now()
       };
 
+      console.log("[ContentScript] Enviando contexto:", event, payload);
+
       chrome.runtime.sendMessage({
         type: MessageType.CONTEXT_UPDATE,
         payload
