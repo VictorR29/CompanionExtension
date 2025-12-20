@@ -138,33 +138,72 @@ const App: React.FC = () => {
   const lastProcessedContextRef = useRef<{ url: string; title: string } | null>(null);
   const navigationDebounceTimerRef = useRef<any>(null);
   const pendingContextRef = useRef<ContextPayload | null>(null);
-  const lastUrlChangeTimeRef = useRef<number>(0);
 
-  // Tiempo de estabilización para navegación (ms) - Aumentado para SPAs
+  // Tiempo de estabilización para navegación (ms)
   const NAVIGATION_SETTLE_TIME = 800;
+  const NAVIGATION_SETTLE_TIME_SHORT = 300; // Para volver a inicio
 
-  // Títulos genéricos que indican que la página aún no ha cargado el contenido real
+  // Títulos genéricos que indican página de inicio o que aún no ha cargado
   const GENERIC_TITLES = [
-    'youtube', 'spotify', 'netflix', 'twitch', 'twitter', 'x',
+    'youtube', 'spotify', 'netflix', 'twitch', 'x',
     'facebook', 'instagram', 'tiktok', 'reddit', 'amazon'
   ];
 
-  // Función para normalizar títulos (ignorar números de notificación como "(4)")
+  // Patrones de URL que indican contenido específico (no página de inicio)
+  const CONTENT_URL_PATTERNS = [
+    /\/watch\?/,           // YouTube video
+    /\/shorts\//,          // YouTube shorts
+    /\/track\//,           // Spotify track
+    /\/album\//,           // Spotify album
+    /\/playlist\//,        // Playlist
+    /\/video\//,           // Generic video
+    /\/post\//,            // Posts
+    /\/status\//,          // Twitter status
+    /\/reel\//,            // Instagram reel
+    /\/p\//,               // Instagram post
+    /\/@[\w]+\/video/,     // TikTok video
+    /\/title\//,           // Netflix title
+    /\/comments\//,        // Reddit comments
+    /\/dp\//,              // Amazon product
+  ];
+
+  // Función para normalizar títulos
   const normalizeTitle = (title: string): string => {
     return title.replace(/^\(\d+\+?\)\s*/, '').trim();
   };
 
-  // Función para detectar si un título es genérico (solo el nombre del sitio)
+  // Función para detectar si un título es genérico
   const isGenericTitle = (title: string): boolean => {
     const normalized = normalizeTitle(title).toLowerCase();
-    // Si el título es SOLO el nombre del sitio (o muy similar), es genérico
     return GENERIC_TITLES.some(site => {
-      // El título es genérico si es exactamente el nombre del sitio
-      // o si es el nombre del sitio + algo muy corto (ej: "YouTube" o "YouTube -")
       return normalized === site ||
         normalized === `${site} -` ||
         normalized.length <= site.length + 3 && normalized.startsWith(site);
     });
+  };
+
+  // Función para detectar si una URL es de contenido específico
+  const isContentUrl = (url: string): boolean => {
+    return CONTENT_URL_PATTERNS.some(pattern => pattern.test(url));
+  };
+
+  // Función para detectar si es navegación hacia la página de inicio
+  const isNavigatingToHome = (lastUrl: string | undefined, newUrl: string): boolean => {
+    if (!lastUrl) return false;
+
+    // Si la URL anterior era de contenido y la nueva no lo es, probablemente volvió a inicio
+    const wasOnContent = isContentUrl(lastUrl);
+    const nowOnContent = isContentUrl(newUrl);
+
+    // También verificar si la nueva URL es muy corta (típico de página de inicio)
+    try {
+      const newPath = new URL(newUrl).pathname;
+      const isHomePath = newPath === '/' || newPath === '' || newPath === '/feed' || newPath === '/home';
+
+      return wasOnContent && (!nowOnContent || isHomePath);
+    } catch {
+      return false;
+    }
   };
 
   useEffect(() => {
@@ -176,11 +215,10 @@ const App: React.FC = () => {
         const isConnected = systemState.status === AssistantStatus.IDLE ||
           systemState.status === AssistantStatus.SPEAKING;
 
-        // Siempre actualizar el display visual (aunque no estemos conectados)
+        // Siempre actualizar el display visual
         latestTabContextRef.current = newContext;
         setCurrentDisplayContext(newContext);
 
-        // Si no estamos conectados, no hacer nada más
         if (!isConnected) {
           return;
         }
@@ -193,7 +231,6 @@ const App: React.FC = () => {
         const isUrlSame = lastProcessed?.url === newContext.url;
         const isTitleSame = normalizedLastTitle === normalizedNewTitle;
 
-        // Si URL y Título son iguales, ignorar completamente
         if (isUrlSame && isTitleSame) {
           return;
         }
@@ -206,13 +243,6 @@ const App: React.FC = () => {
 
         // =========== LÓGICA DE NAVEGACIÓN INTELIGENTE ===========
         if (isNavigation) {
-          const now = Date.now();
-
-          // Si la URL cambió, registrar el momento
-          if (!isUrlSame) {
-            lastUrlChangeTimeRef.current = now;
-          }
-
           // Cancelar cualquier timer pendiente
           if (navigationDebounceTimerRef.current) {
             clearTimeout(navigationDebounceTimerRef.current);
@@ -221,33 +251,61 @@ const App: React.FC = () => {
           // Guardar el contexto más reciente
           pendingContextRef.current = newContext;
 
-          // Si el título es genérico, esperar más tiempo (el contenido aún no cargó)
           const titleIsGeneric = isGenericTitle(newContext.title);
+          const goingToHome = isNavigatingToHome(lastProcessed?.url, newContext.url);
 
-          if (titleIsGeneric) {
-            console.log("[App] Generic title detected, waiting for real content...");
-            // NO iniciar timer - esperar a que llegue un título real
+          // =========== CASO ESPECIAL: VOLVER A INICIO ===========
+          // Si el usuario vuelve a la página de inicio (de contenido → home),
+          // comentar incluso con título genérico
+          if (titleIsGeneric && goingToHome) {
+            console.log("[App] Navigating back to home page...");
+
+            // Usar tiempo de settling más corto para home
+            navigationDebounceTimerRef.current = setTimeout(() => {
+              const stableContext = pendingContextRef.current;
+              if (!stableContext) return;
+
+              const lastProc = lastProcessedContextRef.current;
+              if (lastProc?.url === stableContext.url) {
+                return; // Ya procesamos esta URL
+              }
+
+              lastProcessedContextRef.current = {
+                url: stableContext.url,
+                title: stableContext.title
+              };
+
+              console.log("👁️ Back to Home:", normalizeTitle(stableContext.title));
+              triggerSarcasticComment(stableContext);
+              pendingContextRef.current = null;
+            }, NAVIGATION_SETTLE_TIME_SHORT);
+
             return;
           }
 
+          // =========== CASO NORMAL: TÍTULO GENÉRICO ===========
+          // Si el título es genérico pero NO estamos volviendo a inicio,
+          // probablemente el contenido aún no ha cargado
+          if (titleIsGeneric) {
+            console.log("[App] Generic title, waiting for content...");
+            return; // No iniciar timer, esperar título real
+          }
+
+          // =========== CASO NORMAL: NAVEGACIÓN A CONTENIDO ===========
           console.log("[App] Navigation settling:", normalizedNewTitle.substring(0, 40) + "...");
 
-          // Esperar para asegurar que no hay más cambios
           navigationDebounceTimerRef.current = setTimeout(() => {
             const stableContext = pendingContextRef.current;
             if (!stableContext) return;
 
-            // Verificar que el contexto no cambió durante la espera
             const lastProc = lastProcessedContextRef.current;
             const stableNormalized = normalizeTitle(stableContext.title);
             const lastNormalized = lastProc ? normalizeTitle(lastProc.title) : '';
 
-            // Si ya procesamos esta URL con este título, salir
             if (lastProc?.url === stableContext.url && lastNormalized === stableNormalized) {
               return;
             }
 
-            // Marcar como procesado
             lastProcessedContextRef.current = {
               url: stableContext.url,
               title: stableContext.title
