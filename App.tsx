@@ -134,32 +134,141 @@ const App: React.FC = () => {
   };
 
   // 3. SINCRONIZACIÓN DE VISIÓN (CONTEXTO)
+  // Refs para evitar saludos duplicados y manejar debounce
+  const lastProcessedContextRef = useRef<{ url: string; title: string } | null>(null);
+  const navigationDebounceTimerRef = useRef<any>(null);
+  const pendingContextRef = useRef<ContextPayload | null>(null);
+  const lastUrlChangeTimeRef = useRef<number>(0);
+
+  // Tiempo de estabilización para navegación (ms) - Aumentado para SPAs
+  const NAVIGATION_SETTLE_TIME = 800;
+
+  // Títulos genéricos que indican que la página aún no ha cargado el contenido real
+  const GENERIC_TITLES = [
+    'youtube', 'spotify', 'netflix', 'twitch', 'twitter', 'x',
+    'facebook', 'instagram', 'tiktok', 'reddit', 'amazon'
+  ];
+
+  // Función para normalizar títulos (ignorar números de notificación como "(4)")
+  const normalizeTitle = (title: string): string => {
+    return title.replace(/^\(\d+\+?\)\s*/, '').trim();
+  };
+
+  // Función para detectar si un título es genérico (solo el nombre del sitio)
+  const isGenericTitle = (title: string): boolean => {
+    const normalized = normalizeTitle(title).toLowerCase();
+    // Si el título es SOLO el nombre del sitio (o muy similar), es genérico
+    return GENERIC_TITLES.some(site => {
+      // El título es genérico si es exactamente el nombre del sitio
+      // o si es el nombre del sitio + algo muy corto (ej: "YouTube" o "YouTube -")
+      return normalized === site ||
+        normalized === `${site} -` ||
+        normalized.length <= site.length + 3 && normalized.startsWith(site);
+    });
+  };
+
   useEffect(() => {
     const handleRuntimeMessage = (message: any) => {
       if (message.type === MessageType.CONTEXT_UPDATED) {
         const newContext = message.payload as ContextPayload;
 
-        // Permitir actualizaciones si cambia la URL, la descripción (acción del usuario) o si es un evento crítico
-        const isUrlSame = latestTabContextRef.current?.url === newContext.url;
-        const isDescSame = latestTabContextRef.current?.description === newContext.description;
+        // =========== SOLO PROCESAR SI ESTAMOS CONECTADOS ===========
+        const isConnected = systemState.status === AssistantStatus.IDLE ||
+          systemState.status === AssistantStatus.SPEAKING;
 
-        // Filtro de repetición
-        // Excepción: Acciones de usuario explícitas siempre pasan si la descripción cambió aunque sea levemente
-        const isUserAction = newContext.actionType === 'interaction' || newContext.actionType === 'input' || newContext.actionType === 'media';
-        const isNavigation = newContext.actionType === 'navigate' || (!newContext.actionType && !isUrlSame);
-
-        // Si todo es igual, salir
-        if (isUrlSame && isDescSame) return;
-
-        // Si es la misma URL pero cambia la descripción (acción), permitir pasar
-
-        console.log("👁️ Context/Action Updated:", newContext.description);
+        // Siempre actualizar el display visual (aunque no estemos conectados)
         latestTabContextRef.current = newContext;
         setCurrentDisplayContext(newContext);
 
-        // Si estamos conectados, disparar juicio inmediatamente
-        // Aseguramos que solo dispare si el sistema está listo
-        if (systemState.status === AssistantStatus.IDLE || systemState.status === AssistantStatus.SPEAKING) {
+        // Si no estamos conectados, no hacer nada más
+        if (!isConnected) {
+          return;
+        }
+
+        // =========== VALIDACIÓN DE NO-REPETICIÓN ===========
+        const lastProcessed = lastProcessedContextRef.current;
+        const normalizedNewTitle = normalizeTitle(newContext.title);
+        const normalizedLastTitle = lastProcessed ? normalizeTitle(lastProcessed.title) : '';
+
+        const isUrlSame = lastProcessed?.url === newContext.url;
+        const isTitleSame = normalizedLastTitle === normalizedNewTitle;
+
+        // Si URL y Título son iguales, ignorar completamente
+        if (isUrlSame && isTitleSame) {
+          return;
+        }
+
+        // Determinar tipo de cambio
+        const isNavigation = newContext.actionType === 'navigate' || !isUrlSame || !isTitleSame;
+        const isUserAction = newContext.actionType === 'interaction' ||
+          newContext.actionType === 'input' ||
+          newContext.actionType === 'media';
+
+        // =========== LÓGICA DE NAVEGACIÓN INTELIGENTE ===========
+        if (isNavigation) {
+          const now = Date.now();
+
+          // Si la URL cambió, registrar el momento
+          if (!isUrlSame) {
+            lastUrlChangeTimeRef.current = now;
+          }
+
+          // Cancelar cualquier timer pendiente
+          if (navigationDebounceTimerRef.current) {
+            clearTimeout(navigationDebounceTimerRef.current);
+          }
+
+          // Guardar el contexto más reciente
+          pendingContextRef.current = newContext;
+
+          // Si el título es genérico, esperar más tiempo (el contenido aún no cargó)
+          const titleIsGeneric = isGenericTitle(newContext.title);
+
+          if (titleIsGeneric) {
+            console.log("[App] Generic title detected, waiting for real content...");
+            // NO iniciar timer - esperar a que llegue un título real
+            return;
+          }
+
+          console.log("[App] Navigation settling:", normalizedNewTitle.substring(0, 40) + "...");
+
+          // Esperar para asegurar que no hay más cambios
+          navigationDebounceTimerRef.current = setTimeout(() => {
+            const stableContext = pendingContextRef.current;
+            if (!stableContext) return;
+
+            // Verificar que el contexto no cambió durante la espera
+            const lastProc = lastProcessedContextRef.current;
+            const stableNormalized = normalizeTitle(stableContext.title);
+            const lastNormalized = lastProc ? normalizeTitle(lastProc.title) : '';
+
+            // Si ya procesamos esta URL con este título, salir
+            if (lastProc?.url === stableContext.url && lastNormalized === stableNormalized) {
+              return;
+            }
+
+            // Marcar como procesado
+            lastProcessedContextRef.current = {
+              url: stableContext.url,
+              title: stableContext.title
+            };
+
+            console.log("👁️ Navigation:", stableNormalized.substring(0, 50));
+            triggerSarcasticComment(stableContext);
+            pendingContextRef.current = null;
+          }, NAVIGATION_SETTLE_TIME);
+
+          return;
+        }
+
+        // =========== ACCIONES DE USUARIO (Sin debounce) ===========
+        if (isUserAction) {
+          lastProcessedContextRef.current = {
+            url: newContext.url,
+            title: newContext.title
+          };
+
+          console.log("👁️ Action:", newContext.description);
           triggerSarcasticComment(newContext);
         }
       }
@@ -171,6 +280,9 @@ const App: React.FC = () => {
     return () => {
       if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
         chrome.runtime.onMessage.removeListener(handleRuntimeMessage);
+      }
+      if (navigationDebounceTimerRef.current) {
+        clearTimeout(navigationDebounceTimerRef.current);
       }
     };
   }, [systemState.status]);

@@ -8,25 +8,34 @@
     "activeTab",
     "scripting",
     "windows",
-    "storage"
+    "storage",
+    "webNavigation"
   ],
   "action": {
     "default_title": "Abrir Mascota Sarcástica"
   },
   "background": {
-    "service_worker": "background.js",
-    "type": "module"
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"]
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ]
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["index.html", "assets/*"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "index.html",
+        "assets/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ]
 }

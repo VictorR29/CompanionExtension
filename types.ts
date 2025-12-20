@@ -3,7 +3,8 @@ export enum MessageType {
   BROWSER_ACTIVITY = 'BROWSER_ACTIVITY', // Content -> Background
   GET_LAST_CONTEXT = 'GET_LAST_CONTEXT', // UI -> Background
   CONTEXT_UPDATED = 'CONTEXT_UPDATED',   // Background -> UI (Real-time push)
-  CONTEXT_RESPONSE = 'CONTEXT_RESPONSE'  // Background -> UI (Response to GET)
+  CONTEXT_RESPONSE = 'CONTEXT_RESPONSE', // Background -> UI (Response to GET)
+  CONTEXT_REFRESH_REQUESTED = 'CONTEXT_REFRESH_REQUESTED' // Content -> Background (popstate/pushState)
 }
 
 export interface ContextPayload {

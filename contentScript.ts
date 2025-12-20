@@ -1,6 +1,22 @@
+// Tipos inline para evitar chunk separado (requerido por Chrome Extensions)
+enum MessageType {
+  BROWSER_ACTIVITY = 'BROWSER_ACTIVITY',
+  GET_LAST_CONTEXT = 'GET_LAST_CONTEXT',
+  CONTEXT_UPDATED = 'CONTEXT_UPDATED',
+  CONTEXT_RESPONSE = 'CONTEXT_RESPONSE',
+  CONTEXT_REFRESH_REQUESTED = 'CONTEXT_REFRESH_REQUESTED'
+}
+
+interface ContextPayload {
+  url: string;
+  title: string;
+  description: string;
+  timestamp: number;
+  pageContent?: string;
+  actionType?: "navigate" | "interaction" | "input" | "media";
+}
 
 declare const chrome: any;
-import { MessageType, ContextPayload } from './types';
 
 let debounceTimer: any = null;
 const DEBOUNCE_DELAY = 500;
@@ -48,6 +64,105 @@ function reportActivity(description: string, immediate: boolean = false, actionT
   }
 }
 
+// ============================================
+// DETECCIÓN DE NAVEGACIÓN SPA (Crítico para YouTube/Spotify)
+// ============================================
+
+// Variable para trackear la URL actual
+let currentUrlStr = window.location.href;
+
+// Función para solicitar refresh del contexto al background
+function requestContextRefresh() {
+  if (!chrome.runtime?.id) return;
+
+  try {
+    chrome.runtime.sendMessage({
+      type: MessageType.CONTEXT_REFRESH_REQUESTED
+    }).catch(() => { });
+  } catch (e) {
+    // Ignorar errores
+  }
+}
+
+// 1. LISTENER DE POPSTATE (Botón Atrás/Adelante del navegador)
+window.addEventListener('popstate', () => {
+  console.log("[Companion] PopState detected - navigation back/forward");
+  currentUrlStr = window.location.href;
+
+  // Enviar refresh request inmediato al background
+  requestContextRefresh();
+
+  // También reportar actividad para feedback inmediato
+  setTimeout(() => {
+    reportActivity("El usuario usó el botón de navegación (atrás/adelante)", true, "navigate");
+  }, 150); // Pequeño delay para que el título se actualice
+});
+
+// 2. INTERCEPTAR pushState y replaceState (Navegación interna de SPAs)
+const originalPushState = history.pushState;
+const originalReplaceState = history.replaceState;
+
+history.pushState = function (...args) {
+  const result = originalPushState.apply(this, args);
+
+  // Disparar evento custom para detectarlo
+  window.dispatchEvent(new Event('locationchange'));
+
+  return result;
+};
+
+history.replaceState = function (...args) {
+  const result = originalReplaceState.apply(this, args);
+
+  // Disparar evento custom para detectarlo
+  window.dispatchEvent(new Event('locationchange'));
+
+  return result;
+};
+
+// 3. LISTENER DEL EVENTO CUSTOM DE CAMBIO DE LOCATION
+window.addEventListener('locationchange', () => {
+  const newUrl = window.location.href;
+
+  if (newUrl !== currentUrlStr) {
+    console.log("[Companion] Location change detected (pushState/replaceState):", newUrl);
+    currentUrlStr = newUrl;
+
+    // Solicitar refresh inmediato
+    requestContextRefresh();
+
+    // Reportar con pequeño delay para título fresco
+    setTimeout(() => {
+      reportActivity("El usuario navegó a nueva sección", true, "navigate");
+    }, 150);
+  }
+});
+
+// 4. POLLING DE RESPALDO (Ultra-rápido, 10x por segundo)
+// A veces las soluciones más simples son las más robustas.
+setInterval(() => {
+  const realUrl = window.location.href;
+
+  if (realUrl !== currentUrlStr) {
+    console.log("[Companion] Cambio de URL detectado (Polling):", realUrl);
+    currentUrlStr = realUrl;
+
+    // FASE 1: Actualización Visual Inmediata
+    reportActivity("Navegando...", true, "navigate");
+
+    // FASE 2: Lectura de Contenido con delay
+    if ((window as any).contentTimer) clearTimeout((window as any).contentTimer);
+
+    (window as any).contentTimer = setTimeout(() => {
+      reportActivity("El usuario ha cargado una nueva página.", true, "navigate");
+    }, 800);
+  }
+}, 100);
+
+// ============================================
+// DETECCIONES DE INTERACCIÓN EXISTENTES
+// ============================================
+
 // 1. Detección de Navegación Inicial
 reportActivity("El usuario entró a este sitio.", false, "navigate");
 
@@ -78,10 +193,7 @@ document.addEventListener('mouseup', () => {
   resetIdleTimer();
 });
 
-// 4. Detección de Clics (Botones, Links) - Reemplazado por la nueva lógica de Rage Clicks
-// La lógica original de clics se integrará en la nueva sección de Rage Clicks.
-
-// 5. Detector de Inactividad (Idle)
+// 4. Detector de Inactividad (Idle)
 let idleTimer: any;
 const IDLE_LIMIT = 20000; // 20 segundos
 
@@ -93,10 +205,10 @@ function resetIdleTimer() {
 }
 
 // ==========================================
-// NUEVAS INTERACCIONES (Compadre Mode)
+// INTERACCIONES AVANZADAS
 // ==========================================
 
-// 6. Detección de Multimedia (YouTube, Netflix, etc.)
+// 5. Detección de Multimedia (YouTube, Netflix, etc.)
 document.addEventListener('play', (e) => {
   const target = e.target as HTMLMediaElement;
   if (target.tagName === 'VIDEO' || target.tagName === 'AUDIO') {
@@ -108,7 +220,7 @@ document.addEventListener('play', (e) => {
   }
 }, true); // Capture phase para eventos de media
 
-// 7. Copiar y Pegar
+// 6. Copiar y Pegar
 document.addEventListener('copy', () => {
   const text = window.getSelection()?.toString() || '';
   reportActivity(`El usuario copió texto (${text.length} caracteres).`, true, "interaction");
@@ -118,7 +230,7 @@ document.addEventListener('paste', () => {
   reportActivity("El usuario pegó contenido.", true, "interaction");
 });
 
-// 8. Detección de Rage Clicks (Clics de furia)
+// 7. Detección de Rage Clicks (Clics de furia)
 let lastClickTime = 0;
 let lastClickX = 0;
 let lastClickY = 0;
@@ -128,7 +240,7 @@ document.addEventListener('click', (e: MouseEvent) => {
   const now = Date.now();
   const dist = Math.sqrt(Math.pow(e.clientX - lastClickX, 2) + Math.pow(e.clientY - lastClickY, 2));
 
-  // Si hace clic en el mismo sitio (dist < 20px) muy rápido (< 500ms)
+  // Si hace clic en el mismo sitio (dist < 20px) muy rápido (<500ms)
   if (dist < 20 && (now - lastClickTime) < 500) {
     clickCount++;
   } else {
@@ -160,7 +272,7 @@ document.addEventListener('click', (e: MouseEvent) => {
   resetIdleTimer();
 });
 
-// 9. Detección de Escritura (Typing)
+// 8. Detección de Escritura (Typing)
 let typingTimer: any;
 let keyPressCount = 0;
 
@@ -185,7 +297,7 @@ document.addEventListener('keydown', (e) => {
   resetIdleTimer();
 });
 
-// 10. Detección de Foco (cuando el usuario vuelve a la pestaña)
+// 9. Detección de Foco (cuando el usuario vuelve a la pestaña)
 window.addEventListener('focus', () => {
   reportActivity("El usuario volvió a enfocar esta pestaña.", false, "interaction");
   resetIdleTimer();
@@ -196,17 +308,3 @@ window.addEventListener('focus', () => {
   window.addEventListener(evt, resetIdleTimer);
 });
 resetIdleTimer();
-
-// 11. Detección de Navegación SPA (YouTube, Spotify)
-let lastUrl = window.location.href;
-// Usamos un observer para detectar cambios de URL en SPAs que no recargan
-setInterval(() => {
-  const currentUrl = window.location.href;
-  if (currentUrl !== lastUrl) {
-    lastUrl = currentUrl;
-    // Esperar un momento a que el DOM se actualice con el nuevo contenido
-    setTimeout(() => {
-      reportActivity("El usuario navegó internamente a una nueva sección.", true, "navigate");
-    }, 1500);
-  }
-}, 1000);
