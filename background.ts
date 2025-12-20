@@ -18,9 +18,9 @@ let currentContextState: ContextPayload = {
 async function retrieveActiveTabInfo(): Promise<ContextPayload> {
   try {
     const windows = await chrome.windows.getAll({ populate: true, windowTypes: ['normal'] });
-    
+
     let activeTab = null;
-    
+
     // 1. Intentar obtener de la última ventana enfocada
     const lastFocusedWindow = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }).catch(() => null);
     if (lastFocusedWindow && lastFocusedWindow.tabs) {
@@ -45,7 +45,7 @@ async function retrieveActiveTabInfo(): Promise<ContextPayload> {
         description: 'Navegando activamente',
         timestamp: Date.now()
       };
-      
+
       currentContextState = freshContext;
       return freshContext;
     }
@@ -58,8 +58,13 @@ async function retrieveActiveTabInfo(): Promise<ContextPayload> {
 /**
  * Difunde el estado actual a la interfaz de usuario (Popup).
  */
-async function broadcastSystemState() {
-  const context = await retrieveActiveTabInfo();
+/**
+ * Difunde el estado actual a la interfaz de usuario (Popup).
+ * Si se pasa un contexto explícito, se usa ese (para eventos específicos).
+ * Si no, se recalcula el estado general de la pestaña.
+ */
+async function broadcastSystemState(specificContext?: ContextPayload) {
+  const context = specificContext || await retrieveActiveTabInfo();
   try {
     await chrome.runtime.sendMessage({
       type: MessageType.CONTEXT_UPDATED,
@@ -78,9 +83,12 @@ chrome.tabs.onActivated.addListener(() => {
 });
 
 // 2. Actualización de contenido (carga completa)
+// 2. Actualización de contenido (carga completa o cambio de URL/Título en SPA)
 chrome.tabs.onUpdated.addListener((tabId: number, changeInfo: any, tab: any) => {
-  if (changeInfo.status === 'complete' && tab.active) {
-    broadcastSystemState();
+  if (tab.active) {
+    if (changeInfo.status === 'complete' || changeInfo.url || changeInfo.title) {
+      broadcastSystemState();
+    }
   }
 });
 
@@ -93,12 +101,12 @@ chrome.windows.onFocusChanged.addListener((windowId: number) => {
 
 // 4. Bus de mensajes (Comunicación UI <-> Background)
 chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResponse: any) => {
-  
+
   if (message.type === MessageType.GET_LAST_CONTEXT) {
     retrieveActiveTabInfo().then((context) => {
       sendResponse(context);
     });
-    return true; // Respuesta asíncrona
+    return true; // Respuesta asíncronas
   }
 
   if (message.type === MessageType.BROWSER_ACTIVITY) {
@@ -106,7 +114,8 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
     // Solo actualizamos si es una URL válida y no interna
     if (payload.url && !payload.url.startsWith('chrome-extension://')) {
       currentContextState = payload;
-      broadcastSystemState();
+      // USAR EL PAYLOAD ESPECÍFICO (Clics, Selección, etc.)
+      broadcastSystemState(payload);
     }
   }
 });
@@ -134,7 +143,7 @@ chrome.action.onClicked.addListener(async () => {
     height: 600,
     focused: true
   });
-  
+
   assistantWindowId = newWindow.id || null;
 });
 

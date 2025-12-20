@@ -1,6 +1,6 @@
-import React, { useEffect, useRef, useReducer } from 'react';
+import React, { useEffect, useRef, useReducer, useState } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
-import { AssistantStatus, StateMachineState, MessageType, ContextPayload } from './types';
+import { AssistantStatus, StateMachineState, MessageType, ContextPayload, QueuedMessage } from './types';
 
 declare const chrome: any;
 
@@ -59,12 +59,12 @@ function encodeFloat32ToBase64(float32Array: Float32Array): string {
 
 const App: React.FC = () => {
   const [systemState, dispatch] = useReducer(systemReducer, initialState);
-  
+
   // --- REFERENCIAS DE ARQUITECTURA (NO PRIMITIVOS) ---
   const liveSessionRef = useRef<any>(null);
-  const pendingMessageQueueRef = useRef<object[]>([]); // Cola de mensajes
+  const pendingMessageQueueRef = useRef<QueuedMessage[]>([]); // Cola de mensajes tipada
   const latestTabContextRef = useRef<ContextPayload | null>(null);
-  
+
   // --- REFERENCIAS DE AUDIO ---
   const audioContextRef = useRef<AudioContext | null>(null);
   const inputContextRef = useRef<AudioContext | null>(null);
@@ -73,12 +73,13 @@ const App: React.FC = () => {
   const audioQueueParamsRef = useRef<{ nextStartTime: number }>({ nextStartTime: 0 });
 
   // --- VISUAL UI STATE ---
-  const [currentDisplayContext, setCurrentDisplayContext] = React.useState<ContextPayload | null>(null);
+  const [currentDisplayContext, setCurrentDisplayContext] = useState<ContextPayload | null>(null);
 
   // 1. INICIALIZACIÓN DEL ENTORNO
   useEffect(() => {
     // Inicializar AudioContext de salida (Lazy init para cumplir políticas de navegador)
     if (!audioContextRef.current) {
+      // @ts-ignore
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
         sampleRate: AUDIO_CONFIG.OUTPUT_SAMPLE_RATE,
       });
@@ -97,35 +98,39 @@ const App: React.FC = () => {
   }, []);
 
   // 2. SISTEMA DE MENSAJERÍA ROBUSTO (QUEUE PATTERN)
-  const sendToGeminiSafe = (contentObj: object) => {
+  const sendToGeminiSafe = (parts: any[], turnComplete: boolean = true) => {
     if (liveSessionRef.current) {
       try {
-        liveSessionRef.current.send(contentObj);
-        console.log("✅ [Direct Send]", contentObj);
+        liveSessionRef.current.sendClientContent({
+          turns: [{ role: 'user', parts: parts }],
+          turnComplete: turnComplete
+        });
+        console.log("✅ [Direct Send]", parts);
       } catch (err) {
         console.error("❌ Send Error:", err);
       }
     } else {
       console.warn("⚠️ [Queueing] Socket not ready. Pushing to queue.");
-      pendingMessageQueueRef.current.push(contentObj);
+      pendingMessageQueueRef.current.push({ parts, turnComplete });
     }
   };
 
   const triggerSarcasticComment = (context: ContextPayload) => {
     if (!context) return;
 
-    // Estructura JSON requerida por el usuario
-    const systemPrompt = {
-      clientContent: {
-        turns: [{
-          role: "user",
-          parts: [{ text: `[SYSTEM EVENT] El usuario cambió a: ${context.title}. URL: ${context.url}. Júzgalo sarcásticamente.` }]
-        }],
-        turnComplete: true
-      }
-    };
+    // Construir prompt con contenido si disponible
+    let promptText = `[SYSTEM EVENT] Acción del usuario: ${context.description} (en ${context.title}).`;
 
-    sendToGeminiSafe(systemPrompt);
+    if (context.pageContent && (context.description.includes("entró") || context.actionType === 'navigate')) {
+      // Si es una navegación nueva, damos contexto del contenido
+      promptText += `\nContenido visible de la página: "${context.pageContent.substring(0, 500)}..."`;
+      promptText += `\nUsa esto para comentar sobre lo que el usuario está viendo, si es relevante.`;
+    } else {
+      promptText += `\nResponde brevemente a esta acción con tu personalidad.`;
+    }
+
+    const textPart = { text: promptText };
+    sendToGeminiSafe([textPart], true);
   };
 
   // 3. SINCRONIZACIÓN DE VISIÓN (CONTEXTO)
@@ -133,15 +138,27 @@ const App: React.FC = () => {
     const handleRuntimeMessage = (message: any) => {
       if (message.type === MessageType.CONTEXT_UPDATED) {
         const newContext = message.payload as ContextPayload;
-        
-        // Evitar duplicados si el contexto es idéntico
-        if (latestTabContextRef.current?.url === newContext.url) return;
 
-        console.log("👁️ Context Changed:", newContext.title);
+        // Permitir actualizaciones si cambia la URL, la descripción (acción del usuario) o si es un evento crítico
+        const isUrlSame = latestTabContextRef.current?.url === newContext.url;
+        const isDescSame = latestTabContextRef.current?.description === newContext.description;
+
+        // Filtro de repetición
+        // Excepción: Acciones de usuario explícitas siempre pasan si la descripción cambió aunque sea levemente
+        const isUserAction = newContext.actionType === 'interaction' || newContext.actionType === 'input' || newContext.actionType === 'media';
+        const isNavigation = newContext.actionType === 'navigate' || (!newContext.actionType && !isUrlSame);
+
+        // Si todo es igual, salir
+        if (isUrlSame && isDescSame) return;
+
+        // Si es la misma URL pero cambia la descripción (acción), permitir pasar
+
+        console.log("👁️ Context/Action Updated:", newContext.description);
         latestTabContextRef.current = newContext;
         setCurrentDisplayContext(newContext);
 
         // Si estamos conectados, disparar juicio inmediatamente
+        // Aseguramos que solo dispare si el sistema está listo
         if (systemState.status === AssistantStatus.IDLE || systemState.status === AssistantStatus.SPEAKING) {
           triggerSarcasticComment(newContext);
         }
@@ -176,12 +193,12 @@ const App: React.FC = () => {
     if (audioQueueParamsRef.current.nextStartTime < currentTime) {
       audioQueueParamsRef.current.nextStartTime = currentTime;
     }
-    
+
     sourceNode.start(audioQueueParamsRef.current.nextStartTime);
     audioQueueParamsRef.current.nextStartTime += buffer.duration;
 
     dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.SPEAKING });
-    
+
     sourceNode.onended = () => {
       // Histerésis pequeña para evitar parpadeo de estado
       if (context.currentTime >= audioQueueParamsRef.current.nextStartTime - 0.1) {
@@ -195,18 +212,19 @@ const App: React.FC = () => {
     try {
       if (mediaStreamRef.current) return; // Ya iniciado
 
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: { 
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
           sampleRate: AUDIO_CONFIG.INPUT_SAMPLE_RATE,
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true
-        } 
+        }
       });
       mediaStreamRef.current = stream;
 
+      // @ts-ignore
       inputContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
-        sampleRate: AUDIO_CONFIG.INPUT_SAMPLE_RATE 
+        sampleRate: AUDIO_CONFIG.INPUT_SAMPLE_RATE
       });
 
       const source = inputContextRef.current.createMediaStreamSource(stream);
@@ -219,7 +237,7 @@ const App: React.FC = () => {
 
         const inputData = event.inputBuffer.getChannelData(0);
         const base64Encoded = encodeFloat32ToBase64(inputData);
-        
+
         try {
           sessionInstance.sendRealtimeInput({
             media: { mimeType: 'audio/pcm;rate=16000', data: base64Encoded }
@@ -273,39 +291,45 @@ const App: React.FC = () => {
       // 2. Obtener Contexto Inicial del Background
       const initialContext: ContextPayload = await new Promise((resolve) => {
         chrome.runtime.sendMessage({ type: MessageType.GET_LAST_CONTEXT }, (response: any) => {
-          resolve(response || { title: 'Desconocido', url: 'about:blank' });
+          resolve(response || { title: 'Desconocido', url: 'about:blank', description: "Inicio", timestamp: 0 });
         });
       });
-      
+
       latestTabContextRef.current = initialContext;
       setCurrentDisplayContext(initialContext);
 
       // 3. Iniciar Cliente GenAI
       const genAIClient = new GoogleGenAI({ apiKey: systemState.apiKey });
-      
+
       // 4. Establecer Conexión (Promise)
       const session = await genAIClient.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: `Eres Glitch, un asistente sarcástico y cínico. Tu único propósito es juzgar las páginas web que visita el usuario. Sé breve y mordaz.`,
+          systemInstruction: { parts: [{ text: `Eres Glitch, un asistente sarcástico y cínico. Tu único propósito es juzgar las páginas web que visita el usuario. Sé breve y mordaz.` }] },
         },
         callbacks: {
           onopen: () => {
             console.log("🌐 Conexión Establecida.");
-            
+
             // FLUSH QUEUE: Enviar mensajes pendientes
             while (pendingMessageQueueRef.current.length > 0) {
               const msg = pendingMessageQueueRef.current.shift();
-              if (msg) session.send(msg);
+              if (msg) {
+                // @ts-ignore
+                session.sendClientContent({
+                  turns: [{ role: 'user', parts: msg.parts }],
+                  turnComplete: msg.turnComplete
+                });
+              }
             }
           },
           onmessage: (serverMessage: LiveServerMessage) => {
             // Procesar Audio
             const audioData = serverMessage.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (audioData) processAudioChunk(audioData);
-            
+
             // Actualizar Estado
             if (serverMessage.serverContent?.turnComplete) {
               dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.IDLE });
@@ -327,7 +351,7 @@ const App: React.FC = () => {
 
       // 6. Iniciar Audio Input (SOLO AHORA ES SEGURO)
       await initializeAudioInput(session);
-      
+
       dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.IDLE });
 
       // 7. Prompt Inicial
@@ -357,9 +381,9 @@ const App: React.FC = () => {
         <div className="mascot-large">🔑</div>
         <h2>ACCESO REQUERIDO</h2>
         <div className="input-group">
-          <input 
-            type="password" 
-            placeholder="Pegar API Key" 
+          <input
+            type="password"
+            placeholder="Pegar API Key"
             onBlur={(e) => saveApiKey(e.target.value)}
           />
         </div>
@@ -377,30 +401,30 @@ const App: React.FC = () => {
 
       <div className="mascot-display">
         <div className={`mascot-large ${systemState.status === AssistantStatus.SPEAKING ? 'animate-pulse' : ''}`}>
-           {systemState.status === AssistantStatus.SPEAKING ? '🤬' : 
+          {systemState.status === AssistantStatus.SPEAKING ? '🤬' :
             systemState.status === AssistantStatus.CONNECTING ? '🔌' :
-            systemState.status === AssistantStatus.ERROR ? '💀' : 
-            systemState.status === AssistantStatus.IDLE ? '👀' : '💤'}
+              systemState.status === AssistantStatus.ERROR ? '💀' :
+                systemState.status === AssistantStatus.IDLE ? '👀' : '💤'}
         </div>
-        
+
         <p className="status-text">{systemState.error ? systemState.error : systemState.status}</p>
-        
+
         <div className={`voice-visualizer ${systemState.status === AssistantStatus.SPEAKING ? 'active' : ''}`}>
-           <div className={`bar ${systemState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
-           <div className={`bar ${systemState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
-           <div className={`bar ${systemState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
+          <div className={`bar ${systemState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
+          <div className={`bar ${systemState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
+          <div className={`bar ${systemState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
         </div>
       </div>
-      
+
       <div className="controls">
         {systemState.status === AssistantStatus.DISCONNECTED || systemState.status === AssistantStatus.ERROR ? (
-           <button className="primary-btn" onClick={connectToGemini}>
-             CONECTAR SISTEMA
-           </button>
+          <button className="primary-btn" onClick={connectToGemini}>
+            CONECTAR SISTEMA
+          </button>
         ) : (
-           <button className="secondary-btn" onClick={handleDisconnect}>
-             DESCONECTAR
-           </button>
+          <button className="secondary-btn" onClick={handleDisconnect}>
+            DESCONECTAR
+          </button>
         )}
       </div>
     </div>
