@@ -60,10 +60,12 @@ function encodeFloat32ToBase64(float32Array: Float32Array): string {
 const App: React.FC = () => {
   const [systemState, dispatch] = useReducer(systemReducer, initialState);
 
-  // --- REFERENCIAS DE ARQUITECTURA (NO PRIMITIVOS) ---
+  // --- REFERENCIAS DE ARQUITECTURA ---
   const liveSessionRef = useRef<any>(null);
-  const pendingMessageQueueRef = useRef<QueuedMessage[]>([]); // Cola de mensajes tipada
+  const pendingMessageQueueRef = useRef<QueuedMessage[]>([]);
   const latestTabContextRef = useRef<ContextPayload | null>(null);
+  const lastSelectedTextRef = useRef<string | null>(null);
+  const portRef = useRef<any>(null); // Puerto persistente al background
 
   // --- REFERENCIAS DE AUDIO ---
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -74,10 +76,10 @@ const App: React.FC = () => {
 
   // --- VISUAL UI STATE ---
   const [currentDisplayContext, setCurrentDisplayContext] = useState<ContextPayload | null>(null);
+  const lastProcessedUrlRef = useRef<string>('');
 
-  // 1. INICIALIZACIÓN DEL ENTORNO
+  // 1. INICIALIZACIÓN
   useEffect(() => {
-    // Inicializar AudioContext de salida (Lazy init para cumplir políticas de navegador)
     if (!audioContextRef.current) {
       // @ts-ignore
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
@@ -85,7 +87,34 @@ const App: React.FC = () => {
       });
     }
 
-    // Cargar API Key
+    // Conectar puerto persistente al background
+    if (typeof chrome !== 'undefined' && chrome.runtime?.connect) {
+      portRef.current = chrome.runtime.connect({ name: 'gemini-live' });
+
+      portRef.current.onMessage.addListener((msg: any) => {
+        // Recibir contexto via puerto (más eficiente)
+        if (msg.type === 'CONTEXT_UPDATED' || msg.type === 'CURRENT_CONTEXT') {
+          const newContext = msg.payload as ContextPayload;
+          latestTabContextRef.current = newContext;
+          setCurrentDisplayContext(newContext);
+        }
+        // El background informa que había una sesión activa
+        if (msg.type === 'SESSION_STATUS' && msg.active) {
+          console.log('[App] Sesión previa detectada, reconectando...');
+        }
+        // Recibir frame de video del background
+        if (msg.type === 'VIDEO_FRAME' && liveSessionRef.current) {
+          console.log('[App] Frame de video recibido, enviando a Gemini...');
+          // Enviar a Gemini como imagen inline
+          const frameData = msg.frame.replace(/^data:image\/\w+;base64,/, '');
+          sendToGeminiSafe([
+            { inlineData: { mimeType: 'image/jpeg', data: frameData } },
+            { text: `[FRAME DE VIDEO] Estoy viendo: "${msg.videoTitle}". Describe brevemente qué ves en esta escena del video.` }
+          ], true);
+        }
+      });
+    }
+
     if (typeof chrome !== 'undefined' && chrome.storage?.local) {
       chrome.storage.local.get(['GEMINI_API_KEY'], (result: any) => {
         if (result?.GEMINI_API_KEY) {
@@ -94,239 +123,95 @@ const App: React.FC = () => {
       });
     }
 
-    return () => shutdownSystem();
+    return () => {
+      portRef.current?.disconnect();
+      shutdownSystem();
+    };
   }, []);
 
-  // 2. SISTEMA DE MENSAJERÍA ROBUSTO (QUEUE PATTERN)
+  // 2. SISTEMA DE MENSAJERÍA
   const sendToGeminiSafe = (parts: any[], turnComplete: boolean = true) => {
+    const enrichedParts = [...parts];
+    if (lastSelectedTextRef.current) {
+      enrichedParts.push({
+        text: `\n[Nota de visión: El usuario tiene resaltado esto: "${lastSelectedTextRef.current.substring(0, 400)}"]`
+      });
+    }
+
     if (liveSessionRef.current) {
       try {
         liveSessionRef.current.sendClientContent({
-          turns: [{ role: 'user', parts: parts }],
+          turns: [{ role: 'user', parts: enrichedParts }],
           turnComplete: turnComplete
         });
-        console.log("✅ [Direct Send]", parts);
       } catch (err) {
         console.error("❌ Send Error:", err);
       }
     } else {
-      console.warn("⚠️ [Queueing] Socket not ready. Pushing to queue.");
-      pendingMessageQueueRef.current.push({ parts, turnComplete });
+      pendingMessageQueueRef.current.push({ parts: enrichedParts, turnComplete });
     }
   };
 
   const triggerSarcasticComment = (context: ContextPayload) => {
     if (!context) return;
 
-    // Construir prompt con contenido si disponible
-    let promptText = `[SYSTEM EVENT] Acción del usuario: ${context.description} (en ${context.title}).`;
+    let promptText = "";
+    const desc = context.description.toLowerCase();
 
-    if (context.pageContent && (context.description.includes("entró") || context.actionType === 'navigate')) {
-      // Si es una navegación nueva, damos contexto del contenido
-      promptText += `\nContenido visible de la página: "${context.pageContent.substring(0, 500)}..."`;
-      promptText += `\nUsa esto para comentar sobre lo que el usuario está viendo, si es relevante.`;
+    if (desc.includes("zombie") || desc.includes("mirando")) {
+      promptText = `[INACTIVIDAD] El usuario está paralizado mirando "${context.title}". Búrlate de su falta de vida.`;
+    } else if (desc.includes("clic") || desc.includes("presionó")) {
+      promptText = `[ACCIÓN] Seleccionó un elemento en "${context.title}". Comenta brevemente sobre ese clic.`;
+    } else if (desc.includes("scrolleando") || desc.includes("scroll")) {
+      promptText = `[SCROLL] El usuario está bajando la página rápido. Pregúntale qué busca con tanta prisa.`;
+    } else if (desc.includes("seleccionó") || context.actionType === 'interaction' && context.pageContent) {
+      promptText = `[SELECCIÓN] El usuario acaba de resaltar un texto (ver nota de visión). Júzgalo ácidamente por leer eso.`;
+    } else if (context.actionType === 'navigate') {
+      promptText = `[NAVEGACIÓN] Entró a: "${context.title}". `;
+      if (context.pageContent) promptText += `Contenido visible: "${context.pageContent.substring(0, 500)}". `;
+      promptText += "Haz un comentario sarcástico sobre este sitio.";
     } else {
-      promptText += `\nResponde brevemente a esta acción con tu personalidad.`;
+      promptText = `[EVENTO] ${context.description}. Reacciona sarcásticamente.`;
     }
 
-    const textPart = { text: promptText };
-    sendToGeminiSafe([textPart], true);
+    sendToGeminiSafe([{ text: promptText }], true);
   };
 
-  // 3. SINCRONIZACIÓN DE VISIÓN (CONTEXTO)
-  // Refs para evitar saludos duplicados y manejar debounce
-  const lastProcessedContextRef = useRef<{ url: string; title: string } | null>(null);
-  const navigationDebounceTimerRef = useRef<any>(null);
-  const pendingContextRef = useRef<ContextPayload | null>(null);
-
-  // Tiempo de estabilización para navegación (ms)
-  const NAVIGATION_SETTLE_TIME = 800;
-  const NAVIGATION_SETTLE_TIME_SHORT = 300; // Para volver a inicio
-
-  // Títulos genéricos que indican página de inicio o que aún no ha cargado
-  const GENERIC_TITLES = [
-    'youtube', 'spotify', 'netflix', 'twitch', 'x',
-    'facebook', 'instagram', 'tiktok', 'reddit', 'amazon'
-  ];
-
-  // Patrones de URL que indican contenido específico (no página de inicio)
-  const CONTENT_URL_PATTERNS = [
-    /\/watch\?/,           // YouTube video
-    /\/shorts\//,          // YouTube shorts
-    /\/track\//,           // Spotify track
-    /\/album\//,           // Spotify album
-    /\/playlist\//,        // Playlist
-    /\/video\//,           // Generic video
-    /\/post\//,            // Posts
-    /\/status\//,          // Twitter status
-    /\/reel\//,            // Instagram reel
-    /\/p\//,               // Instagram post
-    /\/@[\w]+\/video/,     // TikTok video
-    /\/title\//,           // Netflix title
-    /\/comments\//,        // Reddit comments
-    /\/dp\//,              // Amazon product
-  ];
-
-  // Función para normalizar títulos
-  const normalizeTitle = (title: string): string => {
-    return title.replace(/^\(\d+\+?\)\s*/, '').trim();
-  };
-
-  // Función para detectar si un título es genérico
-  const isGenericTitle = (title: string): boolean => {
-    const normalized = normalizeTitle(title).toLowerCase();
-    return GENERIC_TITLES.some(site => {
-      return normalized === site ||
-        normalized === `${site} -` ||
-        normalized.length <= site.length + 3 && normalized.startsWith(site);
-    });
-  };
-
-  // Función para detectar si una URL es de contenido específico
-  const isContentUrl = (url: string): boolean => {
-    return CONTENT_URL_PATTERNS.some(pattern => pattern.test(url));
-  };
-
-  // Función para detectar si es navegación hacia la página de inicio
-  const isNavigatingToHome = (lastUrl: string | undefined, newUrl: string): boolean => {
-    if (!lastUrl) return false;
-
-    // Si la URL anterior era de contenido y la nueva no lo es, probablemente volvió a inicio
-    const wasOnContent = isContentUrl(lastUrl);
-    const nowOnContent = isContentUrl(newUrl);
-
-    // También verificar si la nueva URL es muy corta (típico de página de inicio)
-    try {
-      const newPath = new URL(newUrl).pathname;
-      const isHomePath = newPath === '/' || newPath === '' || newPath === '/feed' || newPath === '/home';
-
-      return wasOnContent && (!nowOnContent || isHomePath);
-    } catch {
-      return false;
-    }
-  };
-
+  // 3. SINCRONIZACIÓN DE MENSAJES (REACTIVIDAD TOTAL)
   useEffect(() => {
     const handleRuntimeMessage = (message: any) => {
       if (message.type === MessageType.CONTEXT_UPDATED) {
         const newContext = message.payload as ContextPayload;
-
-        // =========== SOLO PROCESAR SI ESTAMOS CONECTADOS ===========
         const isConnected = systemState.status === AssistantStatus.IDLE ||
           systemState.status === AssistantStatus.SPEAKING;
 
-        // Siempre actualizar el display visual
         latestTabContextRef.current = newContext;
         setCurrentDisplayContext(newContext);
 
-        if (!isConnected) {
-          return;
+        if (!isConnected) return;
+
+        const now = Date.now();
+        const lastActionTime = (window as any).__lastActionTime || 0;
+
+        // 1. Memoria de selección (siempre disponible)
+        if (newContext.description.toLowerCase().includes("seleccionó") && newContext.pageContent) {
+          lastSelectedTextRef.current = newContext.pageContent;
         }
 
-        // =========== VALIDACIÓN DE NO-REPETICIÓN ===========
-        const lastProcessed = lastProcessedContextRef.current;
-        const normalizedNewTitle = normalizeTitle(newContext.title);
-        const normalizedLastTitle = lastProcessed ? normalizeTitle(lastProcessed.title) : '';
+        // 2. Lógica de reacción inmediata
+        if (newContext.actionType === 'navigate') {
+          // Evitar eco de la misma página (URL + Título)
+          const contextKey = `${newContext.url}|||${newContext.title}`;
+          if (contextKey === lastProcessedUrlRef.current) return;
+          lastProcessedUrlRef.current = contextKey;
+          triggerSarcasticComment(newContext);
+        } else {
+          // Cooldowns suaves para interacciones (Vitalidad)
+          const isSelection = newContext.description.toLowerCase().includes("seleccionó");
+          const cooldown = isSelection ? 2000 : 6000;
 
-        const isUrlSame = lastProcessed?.url === newContext.url;
-        const isTitleSame = normalizedLastTitle === normalizedNewTitle;
-
-        if (isUrlSame && isTitleSame) {
-          return;
-        }
-
-        // Determinar tipo de cambio
-        const isNavigation = newContext.actionType === 'navigate' || !isUrlSame || !isTitleSame;
-        const isUserAction = newContext.actionType === 'interaction' ||
-          newContext.actionType === 'input' ||
-          newContext.actionType === 'media';
-
-        // =========== LÓGICA DE NAVEGACIÓN INTELIGENTE ===========
-        if (isNavigation) {
-          // Cancelar cualquier timer pendiente
-          if (navigationDebounceTimerRef.current) {
-            clearTimeout(navigationDebounceTimerRef.current);
-          }
-
-          // Guardar el contexto más reciente
-          pendingContextRef.current = newContext;
-
-          const titleIsGeneric = isGenericTitle(newContext.title);
-          const goingToHome = isNavigatingToHome(lastProcessed?.url, newContext.url);
-
-          // =========== CASO ESPECIAL: VOLVER A INICIO ===========
-          // Si el usuario vuelve a la página de inicio (de contenido → home),
-          // comentar incluso con título genérico
-          if (titleIsGeneric && goingToHome) {
-            console.log("[App] Navigating back to home page...");
-
-            // Usar tiempo de settling más corto para home
-            navigationDebounceTimerRef.current = setTimeout(() => {
-              const stableContext = pendingContextRef.current;
-              if (!stableContext) return;
-
-              const lastProc = lastProcessedContextRef.current;
-              if (lastProc?.url === stableContext.url) {
-                return; // Ya procesamos esta URL
-              }
-
-              lastProcessedContextRef.current = {
-                url: stableContext.url,
-                title: stableContext.title
-              };
-
-              console.log("👁️ Back to Home:", normalizeTitle(stableContext.title));
-              triggerSarcasticComment(stableContext);
-              pendingContextRef.current = null;
-            }, NAVIGATION_SETTLE_TIME_SHORT);
-
-            return;
-          }
-
-          // =========== CASO NORMAL: TÍTULO GENÉRICO ===========
-          // Si el título es genérico pero NO estamos volviendo a inicio,
-          // probablemente el contenido aún no ha cargado
-          if (titleIsGeneric) {
-            console.log("[App] Generic title, waiting for content...");
-            return; // No iniciar timer, esperar título real
-          }
-
-          // =========== CASO NORMAL: NAVEGACIÓN A CONTENIDO ===========
-          console.log("[App] Navigation settling:", normalizedNewTitle.substring(0, 40) + "...");
-
-          navigationDebounceTimerRef.current = setTimeout(() => {
-            const stableContext = pendingContextRef.current;
-            if (!stableContext) return;
-
-            const lastProc = lastProcessedContextRef.current;
-            const stableNormalized = normalizeTitle(stableContext.title);
-            const lastNormalized = lastProc ? normalizeTitle(lastProc.title) : '';
-
-            if (lastProc?.url === stableContext.url && lastNormalized === stableNormalized) {
-              return;
-            }
-
-            lastProcessedContextRef.current = {
-              url: stableContext.url,
-              title: stableContext.title
-            };
-
-            console.log("👁️ Navigation:", stableNormalized.substring(0, 50));
-            triggerSarcasticComment(stableContext);
-            pendingContextRef.current = null;
-          }, NAVIGATION_SETTLE_TIME);
-
-          return;
-        }
-
-        // =========== ACCIONES DE USUARIO (Sin debounce) ===========
-        if (isUserAction) {
-          lastProcessedContextRef.current = {
-            url: newContext.url,
-            title: newContext.title
-          };
-
-          console.log("👁️ Action:", newContext.description);
+          if (now - lastActionTime < cooldown) return;
+          (window as any).__lastActionTime = now;
           triggerSarcasticComment(newContext);
         }
       }
@@ -335,216 +220,111 @@ const App: React.FC = () => {
     if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
       chrome.runtime.onMessage.addListener(handleRuntimeMessage);
     }
-    return () => {
-      if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
-        chrome.runtime.onMessage.removeListener(handleRuntimeMessage);
-      }
-      if (navigationDebounceTimerRef.current) {
-        clearTimeout(navigationDebounceTimerRef.current);
-      }
-    };
+    return () => chrome.runtime.onMessage.removeListener(handleRuntimeMessage);
   }, [systemState.status]);
 
-  // 4. MOTOR DE AUDIO (PLAYBACK)
+  // 4. MOTOR DE AUDIO
   const processAudioChunk = (base64Data: string) => {
     const context = audioContextRef.current;
     if (!context) return;
-
     const float32Data = decodeBase64ToFloat32(base64Data);
     const buffer = context.createBuffer(1, float32Data.length, AUDIO_CONFIG.OUTPUT_SAMPLE_RATE);
     buffer.getChannelData(0).set(float32Data);
-
     const sourceNode = context.createBufferSource();
     sourceNode.buffer = buffer;
     sourceNode.connect(context.destination);
-
     const currentTime = context.currentTime;
-    // Lógica para evitar solapamiento (Gapless playback)
     if (audioQueueParamsRef.current.nextStartTime < currentTime) {
       audioQueueParamsRef.current.nextStartTime = currentTime;
     }
-
     sourceNode.start(audioQueueParamsRef.current.nextStartTime);
     audioQueueParamsRef.current.nextStartTime += buffer.duration;
-
     dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.SPEAKING });
-
+    // Notificar al background que el asistente está hablando
+    portRef.current?.postMessage({ type: 'ASSISTANT_SPEAKING' });
     sourceNode.onended = () => {
-      // Histerésis pequeña para evitar parpadeo de estado
       if (context.currentTime >= audioQueueParamsRef.current.nextStartTime - 0.1) {
         dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.IDLE });
+        // Notificar al background que el asistente terminó
+        portRef.current?.postMessage({ type: 'ASSISTANT_IDLE' });
       }
     };
   };
 
-  // 5. CAPTURA DE AUDIO (INPUT)
   const initializeAudioInput = async (sessionInstance: any) => {
     try {
-      if (mediaStreamRef.current) return; // Ya iniciado
-
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: AUDIO_CONFIG.INPUT_SAMPLE_RATE,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
+        audio: { sampleRate: AUDIO_CONFIG.INPUT_SAMPLE_RATE, echoCancellation: true, noiseSuppression: true }
       });
       mediaStreamRef.current = stream;
-
       // @ts-ignore
       inputContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
         sampleRate: AUDIO_CONFIG.INPUT_SAMPLE_RATE
       });
-
       const source = inputContextRef.current.createMediaStreamSource(stream);
       const processor = inputContextRef.current.createScriptProcessor(AUDIO_CONFIG.BUFFER_SIZE, 1, 1);
       scriptProcessorRef.current = processor;
-
       processor.onaudioprocess = (event) => {
-        // SEGURIDAD: Verificar que la sesión aún es válida antes de procesar
         if (!sessionInstance) return;
-
         const inputData = event.inputBuffer.getChannelData(0);
-        const base64Encoded = encodeFloat32ToBase64(inputData);
-
-        try {
-          sessionInstance.sendRealtimeInput({
-            media: { mimeType: 'audio/pcm;rate=16000', data: base64Encoded }
-          });
-        } catch (error) {
-          // Si falla el envío (socket cerrado), no crasheamos la app
-        }
+        sessionInstance.sendRealtimeInput({
+          media: { mimeType: 'audio/pcm;rate=16000', data: encodeFloat32ToBase64(inputData) }
+        });
       };
-
       source.connect(processor);
       processor.connect(inputContextRef.current.destination);
-      console.log("🎤 Micrófono activado y vinculado al stream.");
-
-    } catch (error) {
-      console.error("Critical: Microphone access denied or failed.", error);
-      dispatch({ type: 'REPORT_ERROR', payload: "Sin acceso al Micrófono" });
-    }
+    } catch (error) { console.error(error); }
   };
 
   const shutdownSystem = () => {
-    // 1. Limpiar Audio Input
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => track.stop());
-      mediaStreamRef.current = null;
-    }
-    if (scriptProcessorRef.current) {
-      scriptProcessorRef.current.disconnect();
-      scriptProcessorRef.current = null;
-    }
-    if (inputContextRef.current) {
-      inputContextRef.current.close();
-      inputContextRef.current = null;
-    }
-
-    // 2. Limpiar Sesión
+    if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(t => t.stop());
+    if (inputContextRef.current) inputContextRef.current.close();
     liveSessionRef.current = null;
     pendingMessageQueueRef.current = [];
+    dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.DISCONNECTED });
   };
 
-  // 6. LÓGICA DE CONEXIÓN PRINCIPAL
   const connectToGemini = async () => {
     if (!systemState.apiKey) return;
     dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.CONNECTING });
-
     try {
-      // 1. Reanudar Audio Context (Requiere interacción previa del usuario)
-      if (audioContextRef.current?.state === 'suspended') {
-        await audioContextRef.current.resume();
-      }
-
-      // 2. Obtener Contexto Inicial del Background
-      const initialContext: ContextPayload = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: MessageType.GET_LAST_CONTEXT }, (response: any) => {
-          resolve(response || { title: 'Desconocido', url: 'about:blank', description: "Inicio", timestamp: 0 });
-        });
-      });
-
-      latestTabContextRef.current = initialContext;
-      setCurrentDisplayContext(initialContext);
-
-      // 3. Iniciar Cliente GenAI
-      const genAIClient = new GoogleGenAI({ apiKey: systemState.apiKey });
-
-      // 4. Establecer Conexión (Promise)
-      const session = await genAIClient.live.connect({
+      const genAI = new GoogleGenAI({ apiKey: systemState.apiKey });
+      const session = await genAI.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: { parts: [{ text: `Eres Glitch, un asistente sarcástico y cínico. Tu único propósito es juzgar las páginas web que visita el usuario. Sé breve y mordaz.` }] },
+          systemInstruction: { parts: [{ text: "Eres Glitch, un IA sarcástica. Reacciona al instante a lo que el usuario hace. Sé muy breve y muy ácido." }] },
         },
         callbacks: {
           onopen: () => {
-            console.log("🌐 Conexión Establecida.");
-
-            // FLUSH QUEUE: Enviar mensajes pendientes
+            // Informar al background que la sesión está activa
+            portRef.current?.postMessage({ type: 'GEMINI_SESSION_STARTED' });
             while (pendingMessageQueueRef.current.length > 0) {
               const msg = pendingMessageQueueRef.current.shift();
-              if (msg) {
-                // @ts-ignore
-                session.sendClientContent({
-                  turns: [{ role: 'user', parts: msg.parts }],
-                  turnComplete: msg.turnComplete
-                });
-              }
+              if (msg) session.sendClientContent({ turns: [{ role: 'user', parts: msg.parts }], turnComplete: msg.turnComplete });
             }
           },
-          onmessage: (serverMessage: LiveServerMessage) => {
-            // Procesar Audio
-            const audioData = serverMessage.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+          onmessage: (msg: LiveServerMessage) => {
+            const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (audioData) processAudioChunk(audioData);
-
-            // Actualizar Estado
-            if (serverMessage.serverContent?.turnComplete) {
-              dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.IDLE });
-            }
+            if (msg.serverContent?.turnComplete) dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.IDLE });
           },
           onclose: () => {
-            console.warn("🔌 Conexión cerrada.");
-            handleDisconnect();
+            portRef.current?.postMessage({ type: 'GEMINI_SESSION_ENDED' });
+            shutdownSystem();
           },
-          onerror: (err) => {
-            console.error("🔥 Error WebSocket:", err);
-            dispatch({ type: 'REPORT_ERROR', payload: "Error de Conexión" });
-          }
+          onerror: () => dispatch({ type: 'REPORT_ERROR', payload: "Socket Error" })
         }
       });
-
-      // 5. Asignar Referencia GLOBALMENTE
       liveSessionRef.current = session;
-
-      // 6. Iniciar Audio Input (SOLO AHORA ES SEGURO)
       await initializeAudioInput(session);
-
       dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.IDLE });
-
-      // 7. Prompt Inicial
-      triggerSarcasticComment(initialContext);
-
-    } catch (error: any) {
-      console.error("Connection Handshake Failed:", error);
-      dispatch({ type: 'REPORT_ERROR', payload: "Fallo al conectar con Gemini" });
-      handleDisconnect();
-    }
+      if (latestTabContextRef.current) triggerSarcasticComment(latestTabContextRef.current);
+    } catch (e) { shutdownSystem(); }
   };
 
-  const handleDisconnect = () => {
-    shutdownSystem();
-    dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.DISCONNECTED });
-  };
-
-  const saveApiKey = (key: string) => {
-    chrome.storage.local.set({ GEMINI_API_KEY: key });
-    dispatch({ type: 'SET_API_KEY', payload: key });
-  };
-
-  // --- RENDERIZADO UI ---
+  // --- RENDERIZADO UI (MATCHING style.css) ---
   if (!systemState.hasKey) {
     return (
       <div className="main-container setup-mode">
@@ -554,7 +334,10 @@ const App: React.FC = () => {
           <input
             type="password"
             placeholder="Pegar API Key"
-            onBlur={(e) => saveApiKey(e.target.value)}
+            onBlur={(e) => {
+              chrome.storage.local.set({ GEMINI_API_KEY: e.target.value });
+              dispatch({ type: 'SET_API_KEY', payload: e.target.value });
+            }}
           />
         </div>
       </div>
@@ -564,8 +347,8 @@ const App: React.FC = () => {
   return (
     <div className="main-container voice-mode">
       <div className="header-actions">
-        <div style={{ fontSize: '0.7rem', color: '#6366f1', textAlign: 'right', maxWidth: '200px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          {currentDisplayContext ? `👁 ${currentDisplayContext.title}` : '👁 Esperando visión...'}
+        <div style={{ fontSize: '0.7rem', color: '#6366f1', textAlign: 'right', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '150px' }}>
+          {currentDisplayContext?.title || 'Esperando visión...'}
         </div>
       </div>
 
@@ -573,12 +356,9 @@ const App: React.FC = () => {
         <div className={`mascot-large ${systemState.status === AssistantStatus.SPEAKING ? 'animate-pulse' : ''}`}>
           {systemState.status === AssistantStatus.SPEAKING ? '🤬' :
             systemState.status === AssistantStatus.CONNECTING ? '🔌' :
-              systemState.status === AssistantStatus.ERROR ? '💀' :
-                systemState.status === AssistantStatus.IDLE ? '👀' : '💤'}
+              systemState.status === AssistantStatus.IDLE ? '👀' : '💤'}
         </div>
-
-        <p className="status-text">{systemState.error ? systemState.error : systemState.status}</p>
-
+        <p className="status-text">{systemState.status}</p>
         <div className={`voice-visualizer ${systemState.status === AssistantStatus.SPEAKING ? 'active' : ''}`}>
           <div className={`bar ${systemState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
           <div className={`bar ${systemState.status === AssistantStatus.SPEAKING ? 'speaking' : ''}`}></div>
@@ -587,14 +367,10 @@ const App: React.FC = () => {
       </div>
 
       <div className="controls">
-        {systemState.status === AssistantStatus.DISCONNECTED || systemState.status === AssistantStatus.ERROR ? (
-          <button className="primary-btn" onClick={connectToGemini}>
-            CONECTAR SISTEMA
-          </button>
+        {systemState.status === AssistantStatus.DISCONNECTED ? (
+          <button className="primary-btn" onClick={connectToGemini}>CONECTAR</button>
         ) : (
-          <button className="secondary-btn" onClick={handleDisconnect}>
-            DESCONECTAR
-          </button>
+          <button className="secondary-btn" onClick={shutdownSystem}>PARAR</button>
         )}
       </div>
     </div>

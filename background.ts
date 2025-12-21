@@ -31,202 +31,342 @@ let currentContextState: ContextPayload = {
   timestamp: 0
 };
 
-// Variable para evitar broadcasts duplicados en ráfaga
-let lastBroadcastUrl: string = '';
-let lastBroadcastTime: number = 0;
-const BROADCAST_DEBOUNCE_MS = 150;
+// Tracking de la pestaña activa
+let currentActiveTabId: number | null = null;
+
+// Sistema de debounce - trackea URL Y TÍTULO para detectar cambios reales
+let pendingNavigationTimeout: ReturnType<typeof setTimeout> | null = null;
+let lastBroadcastKey: string = ''; // URL + Título combinados
+const NAVIGATION_DEBOUNCE_MS = 1000; // 1s de gracia para SPAs como YouTube
 
 // --- HELPERS DE NAVEGACIÓN ---
 
 /**
- * Obtiene la información de la pestaña activa ignorando la ventana de la extensión.
+ * Detecta si un título es genérico/placeholder (típico de YouTube cargando)
  */
-async function retrieveActiveTabInfo(): Promise<ContextPayload> {
-  try {
-    const windows = await chrome.windows.getAll({ populate: true, windowTypes: ['normal'] });
+const isGenericTitle = (t: string): boolean =>
+  ['youtube', 'home', 'watch', 'video'].includes(t.toLowerCase().trim());
 
-    let activeTab = null;
+/**
+ * Genera una clave única para URL + Título
+ */
+function getContextKey(url: string, title: string): string {
+  return `${url}|||${title}`;
+}
 
-    // 1. Intentar obtener de la última ventana enfocada
-    const lastFocusedWindow = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }).catch(() => null);
-    if (lastFocusedWindow && lastFocusedWindow.tabs) {
-      activeTab = lastFocusedWindow.tabs.find((t: any) => t.active);
-    }
+/**
+ * Sistema centralizado de broadcast con debounce inteligente.
+ * Trackea tanto URL como TÍTULO para detectar cambios reales en SPAs.
+ * Si detecta un título genérico (placeholder), espera 1s más.
+ */
+function scheduleNavigationBroadcast(tabId: number, description: string) {
+  // Cancelar cualquier broadcast pendiente
+  if (pendingNavigationTimeout) {
+    clearTimeout(pendingNavigationTimeout);
+  }
 
-    // 2. Fallback: buscar en cualquier ventana
-    if (!activeTab) {
-      for (const windowItem of windows) {
-        const tab = windowItem.tabs?.find((t: any) => t.active);
-        if (tab) {
-          activeTab = tab;
-          break;
-        }
+  console.log("[Background] Scheduling broadcast for tab:", tabId);
+
+  pendingNavigationTimeout = setTimeout(async () => {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+
+      if (!tab || !tab.url || !tab.active) return;
+      if (tab.url.startsWith('chrome-extension://')) return;
+
+      // Si el título parece placeholder, esperamos 1s más
+      if (isGenericTitle(tab.title || '')) {
+        console.log('[Background] Título genérico detectado, re-intentando…');
+        pendingNavigationTimeout = null;
+        scheduleNavigationBroadcast(tabId, description); // re-schedule
+        return;
       }
-    }
 
-    if (activeTab && activeTab.url && !activeTab.url.startsWith('chrome-extension://')) {
+      const contextKey = getContextKey(tab.url, tab.title);
+
+      // Evitar duplicados solo si URL Y TÍTULO son iguales
+      if (contextKey === lastBroadcastKey) {
+        console.log("[Background] Same URL+Title, skipping");
+        return;
+      }
+
       const freshContext: ContextPayload = {
-        url: activeTab.url,
-        title: activeTab.title || 'Sitio sin nombre',
-        description: 'Navegando activamente',
-        timestamp: Date.now()
+        url: tab.url,
+        title: tab.title || 'Sitio sin nombre',
+        description: description,
+        timestamp: Date.now(),
+        actionType: 'navigate'
       };
 
       currentContextState = freshContext;
-      return freshContext;
+      lastBroadcastKey = contextKey;
+
+      await chrome.runtime.sendMessage({
+        type: MessageType.CONTEXT_UPDATED,
+        payload: freshContext
+      });
+      console.log("[Background] ✓ Broadcast:", freshContext.title);
+    } catch (error) {
+      // Tab cerrado o UI no escuchando
     }
-  } catch (error) {
-    console.error("System Error: Failed to retrieve active tab:", error);
+    pendingNavigationTimeout = null;
+  }, NAVIGATION_DEBOUNCE_MS);
+}
+
+// --- SISTEMA DE COLA CON PRIORIDAD ---
+const behaviorQueue: Record<'hi' | 'mid' | 'low', ContextPayload[]> = {
+  hi: [], mid: [], low: []
+};
+
+const priority = (p: ContextPayload): 'hi' | 'mid' | 'low' =>
+  p.description.includes('seleccionó') ? 'hi' :
+    p.actionType === 'navigate' ? 'mid' : 'low';
+
+/**
+ * Encola un evento de comportamiento según su prioridad.
+ */
+function enqueueBehavior(p: ContextPayload) {
+  behaviorQueue[priority(p)].push(p);
+  // Descartar eventos de baja prioridad si la cola crece mucho
+  if (behaviorQueue.hi.length + behaviorQueue.mid.length > 10) {
+    behaviorQueue.low.shift();
   }
-  return currentContextState;
+  flushBehaviorQueue();
+}
+
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Procesa la cola de comportamiento, priorizando hi > mid > low.
+ */
+function flushBehaviorQueue() {
+  if (flushTimer) clearTimeout(flushTimer);
+
+  flushTimer = setTimeout(() => {
+    const next = behaviorQueue.hi.shift() || behaviorQueue.mid.shift() || behaviorQueue.low.shift();
+    if (next) {
+      currentContextState = next;
+      chrome.runtime.sendMessage({ type: MessageType.CONTEXT_UPDATED, payload: next })
+        .catch(() => { }); // UI no escuchando
+      console.log('[Background] ✓ Queue flush:', next.description);
+      flushBehaviorQueue(); // seguir vaciando
+    }
+  }, 1200);
 }
 
 /**
- * Obtiene el contexto fresco con delay para asegurar que el título ha actualizado.
- * Esto soluciona el bug del "fantasma" donde se mostraba el título de la página anterior.
+ * Obtiene la información de la pestaña activa.
  */
-async function getDelayedFreshContext(tabId: number, description: string = 'Navegación SPA detectada'): Promise<ContextPayload> {
-  return new Promise((resolve) => {
-    // Esperar 100ms para que el título se actualice en sitios como YouTube/Spotify
-    setTimeout(async () => {
-      try {
-        const freshTab = await chrome.tabs.get(tabId);
-        if (freshTab && freshTab.url && !freshTab.url.startsWith('chrome-extension://')) {
-          const freshContext: ContextPayload = {
-            url: freshTab.url,
-            title: freshTab.title || 'Sitio sin nombre',
-            description: description,
-            timestamp: Date.now(),
-            actionType: 'navigate'
-          };
-          currentContextState = freshContext;
-          resolve(freshContext);
-        } else {
-          resolve(currentContextState);
-        }
-      } catch (error) {
-        console.error("Error getting fresh tab:", error);
-        resolve(currentContextState);
-      }
-    }, 100);
-  });
-}
-
-/**
- * Difunde el estado actual a la interfaz de usuario (Popup).
- * Si se pasa un contexto explícito, se usa ese (para eventos específicos).
- * Si no, se recalcula el estado general de la pestaña.
- * Incluye debounce para evitar spam de mensajes.
- */
-async function broadcastSystemState(specificContext?: ContextPayload, forceNow: boolean = false) {
-  const context = specificContext || await retrieveActiveTabInfo();
-
-  // Debounce para evitar ráfagas de broadcasts por la misma URL
-  const now = Date.now();
-  if (!forceNow && context.url === lastBroadcastUrl && (now - lastBroadcastTime) < BROADCAST_DEBOUNCE_MS) {
-    console.log("[Background] Broadcast debounced:", context.url);
-    return;
-  }
-
-  lastBroadcastUrl = context.url;
-  lastBroadcastTime = now;
-
+async function retrieveActiveTabInfo(): Promise<ContextPayload> {
   try {
-    await chrome.runtime.sendMessage({
-      type: MessageType.CONTEXT_UPDATED,
-      payload: context
-    });
-    console.log("[Background] Context broadcast:", context.title);
-  } catch (error) {
-    // La UI no está escuchando (popup cerrado), esto es esperado.
-  }
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const activeTab = tabs[0];
+
+    if (activeTab && activeTab.url && !activeTab.url.startsWith('chrome-extension://')) {
+      return {
+        url: activeTab.url,
+        title: activeTab.title || 'Sitio sin nombre',
+        description: 'Pestaña activa',
+        timestamp: Date.now(),
+        actionType: 'navigate'
+      };
+    }
+  } catch (error) { }
+  return currentContextState;
 }
 
 // --- EVENT LISTENERS ---
 
 // 1. Cambio de pestaña activa
-chrome.tabs.onActivated.addListener(() => {
-  broadcastSystemState();
+chrome.tabs.onActivated.addListener((activeInfo: { tabId: number; windowId: number }) => {
+  if (activeInfo.tabId === currentActiveTabId) return;
+
+  currentActiveTabId = activeInfo.tabId;
+  console.log("[Background] Tab activated:", activeInfo.tabId);
+  scheduleNavigationBroadcast(activeInfo.tabId, 'El usuario cambió a esta pestaña');
 });
 
-// 2. Actualización de contenido (carga completa o cambio de URL/Título en SPA)
+// 2. Actualización de contenido - CLAVE: escuchar TANTO url como title
+// Lista blanca de hosts que sabemos que son SPAs
+const SPA_HOSTS = new Set(['youtube.com', 'spotify.com', 'x.com', 'reddit.com', 'instagram.com']);
+
+function isSPA(url: string) {
+  try {
+    const hostname = new URL(url).hostname.replace(/^www\./, '');
+    return SPA_HOSTS.has(hostname) || hostname.endsWith('.youtube.com');
+  } catch {
+    return false;
+  }
+}
+
+// 2. Actualización de contenido - CLAVE: escuchar TANTO url como title
 chrome.tabs.onUpdated.addListener((tabId: number, changeInfo: any, tab: any) => {
-  if (tab.active) {
-    if (changeInfo.status === 'complete' || changeInfo.url || changeInfo.title) {
-      broadcastSystemState();
+  if (!tab.active) return;
+
+  currentActiveTabId = tabId;
+
+  // Reaccionar a cambios de URL O de título (SPAs actualizan título después)
+  if (changeInfo.url || changeInfo.title) {
+    if (isSPA(tab.url || '')) {
+      console.log('[Background] SPA detectada, esperando señal del content-script');
+      return; // ← no hagas nada, espera al content-script (SPA-Guard)
     }
+
+    console.log("[Background] Tab updated:", changeInfo.url || changeInfo.title);
+    scheduleNavigationBroadcast(tabId, 'El usuario navegó a nuevo contenido');
   }
 });
 
-// 3. Cambio de foco de ventana
-chrome.windows.onFocusChanged.addListener((windowId: number) => {
-  if (windowId !== chrome.windows.WINDOW_ID_NONE) {
-    broadcastSystemState();
-  }
+// 3. Cambio de foco de ventana (sin cambios)
+chrome.windows.onFocusChanged.addListener(async (windowId: number) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+
+  try {
+    const tabs = await chrome.tabs.query({ active: true, windowId: windowId });
+    if (tabs[0] && !tabs[0].url?.startsWith('chrome-extension://')) {
+      if (tabs[0].id !== currentActiveTabId) {
+        currentActiveTabId = tabs[0].id;
+        scheduleNavigationBroadcast(tabs[0].id, 'El usuario cambió de ventana');
+      }
+    }
+  } catch (e) { }
 });
 
-// ============================================
-// 4. DETECCIÓN PROACTIVA DE SPAs (YouTube, Spotify, etc.)
-// Este es el evento CLAVE: Se dispara cuando una SPA cambia la URL 
-// usando pushState/replaceState sin recargar la página.
-// ============================================
-chrome.webNavigation.onHistoryStateUpdated.addListener(async (details: any) => {
-  // Solo procesar el frame principal
+// 4. Navegación SPA (pushState/replaceState) - Ignorar, usamos content-script
+chrome.webNavigation.onHistoryStateUpdated.addListener((details: any) => {
   if (details.frameId !== 0) return;
-
-  console.log("[Background] SPA Navigation detected:", details.url);
-
-  // Obtener contexto fresco con delay para título correcto
-  const freshContext = await getDelayedFreshContext(details.tabId, 'El usuario navegó a nueva sección');
-
-  // Forzar broadcast inmediato
-  broadcastSystemState(freshContext, true);
+  // Solo log, no broadcast directo
+  console.log("[Background] SPA history update:", details.url);
 });
 
-// 5. Bus de mensajes (Comunicación UI <-> Background)
-chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResponse: any) => {
+// 5. Bus de mensajes
+let assistantSpeaking = false; // Para evitar enviar frames mientras habla
 
+chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResponse: any) => {
   if (message.type === MessageType.GET_LAST_CONTEXT) {
-    retrieveActiveTabInfo().then((context) => {
-      sendResponse(context);
-    });
-    return true; // Respuesta asíncronas
+    retrieveActiveTabInfo().then((context) => sendResponse(context));
+    return true;
   }
 
   if (message.type === MessageType.BROWSER_ACTIVITY) {
     const payload = message.payload as ContextPayload;
-    // Solo actualizamos si es una URL válida y no interna
-    if (payload.url && !payload.url.startsWith('chrome-extension://')) {
+
+    // Si es navegación desde content-script, actualizar estado directamente
+    if (payload.actionType === 'navigate' && payload.url) {
+      console.log('[Background] ✓ Commit recibido:', payload.title, payload.url);
       currentContextState = payload;
-      // USAR EL PAYLOAD ESPECÍFICO (Clics, Selección, etc.)
-      broadcastSystemState(payload);
+      lastBroadcastKey = getContextKey(payload.url, payload.title);
+      chrome.runtime.sendMessage({ type: MessageType.CONTEXT_UPDATED, payload });
+      return;
+    }
+
+    if (payload.url && !payload.url.startsWith('chrome-extension://')) {
+      enqueueBehavior(payload);
     }
   }
 
-  // NUEVO: Refresh solicitado desde content.js (popstate/pushState intercept)
   if (message.type === MessageType.CONTEXT_REFRESH_REQUESTED) {
-    const tabId = sender.tab?.id;
-    if (tabId) {
-      console.log("[Background] Context refresh requested from content script");
-      getDelayedFreshContext(tabId, 'El usuario usó navegación del historial').then((freshContext) => {
-        broadcastSystemState(freshContext, true);
+    // Ignorar si es SPA conocida (confiamos en el emitStableContext)
+    const tabUrl = sender.tab?.url || '';
+    if (!isSPA(tabUrl)) {
+      const tabId = sender.tab?.id;
+      if (tabId) scheduleNavigationBroadcast(tabId, 'El usuario usó navegación del historial');
+    }
+  }
+
+  // VIDEO_FRAME: Solo enviar a Gemini si el asistente NO está hablando
+  if ((message as any).type === 'VIDEO_FRAME') {
+    if (assistantSpeaking) {
+      console.log('[Background] Frame ignorado - asistente hablando');
+      return;
+    }
+
+    // Enviar al popup via puerto para que Gemini lo procese
+    if (geminiPort && geminiSessionActive) {
+      geminiPort.postMessage({
+        type: 'VIDEO_FRAME',
+        frame: (message as any).frame,
+        videoTitle: (message as any).videoTitle,
+        timestamp: (message as any).timestamp
       });
+      console.log('[Background] Frame enviado al popup');
     }
   }
 });
 
-// 6. Gestión de Ventana (Singleton Pattern para el Popup)
+// 6. SISTEMA DE PUERTOS PERSISTENTES (Gemini Live)
+let geminiPort: any = null;
+let geminiSessionActive: boolean = false;
+
+chrome.runtime.onConnect.addListener((port: any) => {
+  if (port.name !== 'gemini-live') return;
+
+  console.log('[Background] Puerto gemini-live conectado');
+  geminiPort = port;
+
+  // Informar al popup si ya hay una sesión activa
+  if (geminiSessionActive) {
+    port.postMessage({ type: 'SESSION_STATUS', active: true });
+  }
+
+  port.onMessage.addListener((msg: any) => {
+    // El popup informa que inició sesión Gemini
+    if (msg.type === 'GEMINI_SESSION_STARTED') {
+      geminiSessionActive = true;
+      console.log('[Background] Sesión Gemini iniciada');
+    }
+
+    // El popup informa que cerró sesión Gemini
+    if (msg.type === 'GEMINI_SESSION_ENDED') {
+      geminiSessionActive = false;
+      assistantSpeaking = false;
+      console.log('[Background] Sesión Gemini terminada');
+    }
+
+    // El popup informa que el asistente está hablando
+    if (msg.type === 'ASSISTANT_SPEAKING') {
+      assistantSpeaking = true;
+    }
+
+    // El popup informa que el asistente terminó de hablar
+    if (msg.type === 'ASSISTANT_IDLE') {
+      assistantSpeaking = false;
+    }
+
+    // Reenviar contexto al popup bajo demanda
+    if (msg.type === 'GET_CURRENT_CONTEXT') {
+      port.postMessage({ type: 'CURRENT_CONTEXT', payload: currentContextState });
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    console.log('[Background] Puerto gemini-live desconectado (popup cerrado)');
+    geminiPort = null;
+    // NO cerramos la sesión aquí - el popup puede reconectar
+  });
+});
+
+// Función para enviar contexto al popup via puerto (más eficiente que sendMessage)
+function sendContextToPort(context: ContextPayload) {
+  if (geminiPort) {
+    try {
+      geminiPort.postMessage({ type: 'CONTEXT_UPDATED', payload: context });
+    } catch (e) {
+      geminiPort = null;
+    }
+  }
+}
+
+// 7. Gestión de Ventana Singleton
 let assistantWindowId: number | null = null;
 
 chrome.action.onClicked.addListener(async () => {
   if (assistantWindowId !== null) {
     try {
-      // Verificar si la ventana realmente existe
       await chrome.windows.get(assistantWindowId);
       await chrome.windows.update(assistantWindowId, { focused: true });
       return;
     } catch (error) {
-      // Si falla, el ID es inválido, reseteamos
       assistantWindowId = null;
     }
   }
