@@ -13,7 +13,7 @@ export interface ContextPayload {
   description: string; // "Navegando", "Scrolleando frenéticamente", etc.
   timestamp: number;
   pageContent?: string; // Contenido visible para contexto
-  actionType?: "navigate" | "interaction" | "input" | "media";
+  actionType?: "navigate" | "interaction" | "input" | "media" | "idle";
 }
 
 export interface QueuedMessage {

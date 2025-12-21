@@ -13,7 +13,7 @@ interface ContextPayload {
   description: string;
   timestamp: number;
   pageContent?: string;
-  actionType?: "navigate" | "interaction" | "input" | "media";
+  actionType?: "navigate" | "interaction" | "input" | "media" | "idle";
 }
 
 interface AppMessage {
@@ -251,6 +251,12 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
   if (message.type === MessageType.BROWSER_ACTIVITY) {
     const payload = message.payload as ContextPayload;
 
+    // ⛔ No re-broadcastear inactividad como navegación
+    if (payload.actionType === 'idle') {
+      currentContextState = payload;
+      return;
+    }
+
     // Si es navegación desde content-script, actualizar estado directamente
     if (payload.actionType === 'navigate' && payload.url) {
       console.log('[Background] ✓ Commit recibido:', payload.title, payload.url);
@@ -274,23 +280,34 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
     }
   }
 
-  // VIDEO_FRAME: Solo enviar a Gemini si el asistente NO está hablando
-  if ((message as any).type === 'VIDEO_FRAME') {
-    if (assistantSpeaking) {
-      console.log('[Background] Frame ignorado - asistente hablando');
-      return;
-    }
+  // MEDIA_CAPTURED: Guardar en storage para uso bajo demanda
+  if ((message as any).type === 'MEDIA_CAPTURED') {
+    // Guardamos la última imagen/video capturado
+    // @ts-ignore
+    chrome.storage.session.set({
+      lastMedia: {
+        type: (message as any).mediaType,
+        data: (message as any).data,
+        url: (message as any).url,
+        title: (message as any).title,
+        ts: Date.now()
+      }
+    });
+    console.log('[Background] Media guardado en sesión');
+  }
 
-    // Enviar al popup via puerto para que Gemini lo procese
-    if (geminiPort && geminiSessionActive) {
-      geminiPort.postMessage({
-        type: 'VIDEO_FRAME',
-        frame: (message as any).frame,
-        videoTitle: (message as any).videoTitle,
-        timestamp: (message as any).timestamp
-      });
-      console.log('[Background] Frame enviado al popup');
-    }
+  // GET_VIDEO_FRAME proxy: Popup -> Background -> Active Tab
+  if (message.type === 'GET_VIDEO_FRAME' as any) {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs[0]?.id) {
+        chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_VIDEO_FRAME' }, (response) => {
+          sendResponse(response);
+        });
+      } else {
+        sendResponse(null);
+      }
+    });
+    return true; // async response
   }
 });
 
@@ -303,6 +320,13 @@ chrome.runtime.onConnect.addListener((port: any) => {
 
   console.log('[Background] Puerto gemini-live conectado');
   geminiPort = port;
+
+  // ⬅️ NUEVO: mandamos inmediatamente el último media guardado
+  chrome.storage.session.get(['lastMedia']).then(({ lastMedia }: any) => {
+    if (lastMedia) {
+      port.postMessage({ type: 'LAST_MEDIA', payload: lastMedia });
+    }
+  });
 
   // Informar al popup si ya hay una sesión activa
   if (geminiSessionActive) {

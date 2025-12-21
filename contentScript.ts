@@ -17,7 +17,7 @@ declare const chrome: any;
 
 const CONFIG = {
   SCROLL_THRESHOLD: 3000,
-  IDLE_LIMIT: 45000,
+  IDLE_LIMIT: 50000,
   INTERACTION_COOLDOWN: 5000
 };
 
@@ -48,7 +48,7 @@ let idleTimer: any;
 function resetIdle() {
   clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
-    report("El usuario se quedó mirando la pantalla como un zombie", "interaction");
+    report('El usuario se quedó mirando la pantalla como un zombie', 'idle');
   }, CONFIG.IDLE_LIMIT);
 }
 
@@ -71,15 +71,40 @@ document.addEventListener('mouseup', () => {
   resetIdle();
 });
 
+/********************************************************************
+ *  USER-SCROLL-ONLY  (evita falsos positivos en X, IG, etc.)
+ ********************************************************************/
 let scrollSum = 0;
 let lastY = window.scrollY;
-document.addEventListener('scroll', () => {
-  scrollSum += Math.abs(window.scrollY - lastY);
+let lastTime = Date.now();
+let userScroll = false; // bandera
+
+// Marcamos como "usuario" solo si el scroll viene de wheel/touch/teclas
+['wheel', 'touchmove', 'keydown'].forEach(ev =>
+  window.addEventListener(ev, () => {
+    userScroll = true;
+    resetIdle(); // También reseteamos idle aquí por si acaso
+  }, { passive: true, capture: true })
+);
+
+window.addEventListener('scroll', () => {
+  const now = Date.now();
+  const delta = Math.abs(window.scrollY - lastY);
   lastY = window.scrollY;
+
+  // Descartamos scrolls muy rápidos (< 16 ms) o sin bandera de usuario
+  if (!userScroll || now - lastTime < 16) {
+    lastTime = now;
+    return;
+  }
+
+  scrollSum += delta;
   if (scrollSum > CONFIG.SCROLL_THRESHOLD) {
     scrollSum = 0;
-    report("Está scrolleando intensamente", "interaction");
+    report('Está scrolleando intensamente', 'interaction');
   }
+  lastTime = now;
+  userScroll = false; // reset para el próximo frame
   resetIdle();
 }, { passive: true });
 
@@ -99,58 +124,97 @@ document.addEventListener('keydown', (e) => {
 resetIdle();
 report("El usuario entró a la página", "navigate", document.body.innerText.substring(0, 1000));
 
-// 4. CAPTURA DE FRAMES DE VIDEO (no intrusiva)
-
-/**
- * Captura un frame del video y lo convierte a base64
- */
-function captureFrame(video: HTMLVideoElement): string | null {
+/********************************************************************
+ *  CAPTURA SELECTIVA  (imagen al entrar, video bajo demanda)
+ ********************************************************************/
+const captureImage = (img: HTMLImageElement): string => {
+  const canvas = document.createElement('canvas');
+  const max = 1024;
+  const ratio = Math.min(max / img.naturalWidth, max / img.naturalHeight, 1);
+  canvas.width = img.naturalWidth * ratio;
+  canvas.height = img.naturalHeight * ratio;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return '';
   try {
-    const canvas = document.createElement('canvas');
-    // Resolución reducida para no saturar
-    const scale = Math.min(1, 640 / video.videoWidth);
-    canvas.width = video.videoWidth * scale;
-    canvas.height = video.videoHeight * scale;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.85);
+  } catch (e) { return ''; }
+};
+
+const captureVideoFrame = (video: HTMLVideoElement): string => {
+  const canvas = document.createElement('canvas');
+  canvas.width = 320;
+  canvas.height = 180;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return '';
+  try {
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    // JPEG con calidad media para reducir tamaño
     return canvas.toDataURL('image/jpeg', 0.6);
-  } catch (e) {
-    // Video de origen cruzado (CORS)
-    return null;
+  } catch (e) { return ''; }
+};
+
+// ---------- IMÁGENES ----------
+// Observa el DOM una sola vez al entrar
+const imgObserver = new MutationObserver(() => {
+  // 1. ¿Estamos DENTRO de una publicación única?
+  const isPostView = /\/(status|p|pin)\/[\w-]+/.test(location.pathname);
+  if (!isPostView) return;
+
+  // 2. Busca la imagen PRINCIPAL (la más grande o la primera grande)
+  const img = Array.from(document.images)
+    .filter(i => i.naturalWidth > 300 && i.src && i.src.startsWith('http'))
+    .sort((a, b) => b.naturalWidth - a.naturalWidth)[0];
+
+  if (img && !img.dataset.glitchCaptured) {
+    img.dataset.glitchCaptured = '1';
+    // Esperar a que cargue si no está lista
+    if (img.complete) {
+      processImage(img);
+    } else {
+      img.onload = () => processImage(img);
+    }
   }
+});
+
+function processImage(img: HTMLImageElement) {
+  const tryCapture = (attempt: number) => {
+    if (attempt > 3 || img.naturalWidth === 0) return;
+    if (img.complete && img.naturalWidth > 0) {
+      const data = captureImage(img);
+      if (data) {
+        chrome.runtime.sendMessage({ type: 'MEDIA_CAPTURED', mediaType: 'image', data, url: location.href, title: document.title }).catch(() => { });
+        console.log('[Content] Imagen capturada y enviada');
+      }
+      return;
+    }
+    setTimeout(() => tryCapture(attempt + 1), 800);
+  };
+  tryCapture(1);
 }
 
-let lastFrameSent = 0;
+imgObserver.observe(document.body, { childList: true, subtree: true });
 
-setInterval(() => {
-  const video = document.querySelector('video') as HTMLVideoElement;
-  if (!video || video.paused) return;
-
-  const now = Date.now();
-  if (now - lastFrameSent < 5000) return; // Solo cada 5s
-
-  // Verificar que el video esté visible en viewport (80%+)
-  const io = new IntersectionObserver((entries) => {
-    if (entries[0].isIntersecting) {
-      const frame = captureFrame(video);
-      if (frame) {
-        chrome.runtime.sendMessage({
-          type: 'VIDEO_FRAME',
-          frame,
-          videoTitle: document.title,
-          timestamp: now
-        }).catch(() => { });
-        lastFrameSent = now;
-        console.log('[Content] Frame de video enviado');
-      }
-    }
-    io.disconnect();
-  }, { threshold: 0.8 });
-
-  io.observe(video);
+// ---------- VÍDEOS ----------
+// Guardamos referencia al video visible (sin capturar aún)
+let activeVideo: HTMLVideoElement | null = null;
+const videoPoller = setInterval(() => {
+  const v = document.querySelector('video') as HTMLVideoElement;
+  if (v && !v.paused && v.readyState >= 2) activeVideo = v;
+  else activeVideo = null;
 }, 1000);
+
+// Escucha pedido de frame desde background
+chrome.runtime.onMessage.addListener((msg: any, sender: any, sendResponse: any) => {
+  if (msg.type === 'GET_VIDEO_FRAME') {
+    if (activeVideo) {
+      const frame = captureVideoFrame(activeVideo);
+      sendResponse({ frame, url: location.href, title: document.title });
+    } else {
+      sendResponse(null);
+    }
+    return true; // async
+  }
+});
 
 /*********************************************************************
  *  UNIVERSAL SPA-Guard

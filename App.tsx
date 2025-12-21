@@ -65,6 +65,7 @@ const App: React.FC = () => {
   const pendingMessageQueueRef = useRef<QueuedMessage[]>([]);
   const latestTabContextRef = useRef<ContextPayload | null>(null);
   const lastSelectedTextRef = useRef<string | null>(null);
+  const lastMediaRef = useRef<any>(null); // Última imagen/video vista
   const portRef = useRef<any>(null); // Puerto persistente al background
 
   // --- REFERENCIAS DE AUDIO ---
@@ -93,25 +94,21 @@ const App: React.FC = () => {
 
       portRef.current.onMessage.addListener((msg: any) => {
         // Recibir contexto via puerto (más eficiente)
+        if (msg.type === 'LAST_MEDIA') { lastMediaRef.current = msg.payload; }
         if (msg.type === 'CONTEXT_UPDATED' || msg.type === 'CURRENT_CONTEXT') {
           const newContext = msg.payload as ContextPayload;
           latestTabContextRef.current = newContext;
           setCurrentDisplayContext(newContext);
         }
+        // Recibir media inicial o actualizado
+        if (msg.type === 'LAST_MEDIA') {
+          lastMediaRef.current = msg.payload;
+        }
         // El background informa que había una sesión activa
         if (msg.type === 'SESSION_STATUS' && msg.active) {
           console.log('[App] Sesión previa detectada, reconectando...');
         }
-        // Recibir frame de video del background
-        if (msg.type === 'VIDEO_FRAME' && liveSessionRef.current) {
-          console.log('[App] Frame de video recibido, enviando a Gemini...');
-          // Enviar a Gemini como imagen inline
-          const frameData = msg.frame.replace(/^data:image\/\w+;base64,/, '');
-          sendToGeminiSafe([
-            { inlineData: { mimeType: 'image/jpeg', data: frameData } },
-            { text: `[FRAME DE VIDEO] Estoy viendo: "${msg.videoTitle}". Describe brevemente qué ves en esta escena del video.` }
-          ], true);
-        }
+        // (Listener VIDEO_FRAME eliminado - ahora es bajo demanda)
       });
     }
 
@@ -130,7 +127,54 @@ const App: React.FC = () => {
   }, []);
 
   // 2. SISTEMA DE MENSAJERÍA
-  const sendToGeminiSafe = (parts: any[], turnComplete: boolean = true) => {
+
+  // Detecta frases que implican “qué vídeo estoy viendo”
+  const isVideoQuestion = (text: string) =>
+    /\b(video|vídeo|clip|lo que estoy viendo)\b/i.test(text) &&
+    /\b(explica|resume|qué te parece|opina|comenta|cuéntame)\b/i.test(text);
+
+  const askAboutVideo = async () => {
+    // 1. Verificar si hay guardado en sesión
+    // @ts-ignore
+    const now = Date.now();
+    const stored = lastMediaRef.current;
+    if (stored && (now - stored.ts < 60000)) {
+      const prompt = [{ text: 'El usuario pregunta por el contenido visual.' }, { inlineData: { mimeType: 'image/jpeg', data: stored.data.replace(/^data:image\/\w+;base64,/, '') } }, { text: `Contexto guardado: ${stored.title} (${stored.url})` }];
+      sendToGeminiSafe(prompt, true, true);
+      return;
+    }
+    // const { lastMedia } = ... (REMOVED)
+
+    // Si hay un video reciente guardado o queremos pedir frame en vivo
+    // La estrategia dice: Video solo si usuario pregunta -> pedir frame en vivo
+
+    // Pedimos 1 frame en vivo
+    const frame = await chrome.runtime.sendMessage({ type: 'GET_VIDEO_FRAME' });
+
+    if (!frame) {
+
+      sendToGeminiSafe([{ text: 'No veo ningún video reproduciéndose ahora mismo.' }], true, true);
+      return;
+    }
+
+    const prompt = [
+      { text: 'El usuario acaba de pedirte que comentes el vídeo que está viendo.' },
+      { inlineData: { mimeType: 'image/jpeg', data: frame.frame.replace(/^data:image\/\w+;base64,/, '') } },
+      { text: `Título de la página: ${frame.title}. URL: ${frame.url}` }
+    ];
+    sendToGeminiSafe(prompt, true, true);
+  };
+
+  const sendToGeminiSafe = (parts: any[], turnComplete: boolean = true, skipVideoCheck: boolean = false) => {
+    // Intercepción para VIDEO
+    if (!skipVideoCheck && parts.length > 0 && parts[0].text) {
+      if (isVideoQuestion(parts[0].text)) {
+        console.log('[App] Detectada pregunta de video -> Iniciando captura bajo demanda');
+        askAboutVideo();
+        return;
+      }
+    }
+
     const enrichedParts = [...parts];
     if (lastSelectedTextRef.current) {
       enrichedParts.push({
@@ -199,6 +243,11 @@ const App: React.FC = () => {
         }
 
         // 2. Lógica de reacción inmediata
+        if (newContext.actionType === 'idle') {
+          triggerSarcasticComment(newContext); // 👹 reacción personalizada
+          return;
+        }
+
         if (newContext.actionType === 'navigate') {
           // Evitar eco de la misma página (URL + Título)
           const contextKey = `${newContext.url}|||${newContext.title}`;
