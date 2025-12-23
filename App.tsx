@@ -128,50 +128,71 @@ const App: React.FC = () => {
 
   // 2. SISTEMA DE MENSAJERÍA
 
-  // Detecta frases que implican “qué vídeo estoy viendo”
-  const isVideoQuestion = (text: string) =>
-    /\b(video|vídeo|clip|lo que estoy viendo)\b/i.test(text) &&
-    /\b(explica|resume|qué te parece|opina|comenta|cuéntame)\b/i.test(text);
+  // 3. DETECTOR DE PREGUNTA – tanto imagen como video
+  const isMediaQuestion = (text: string) => {
+    const imgQ = /\b(imagen|foto|picture|imágen)\b/i.test(text);
+    const vidQ = /\b(vídeo|video|clip)\b/i.test(text);
+    const ask = /\b(describe|qué te parece|opina|explica|cuéntame)\b/i.test(text);
+    return ask && (imgQ || vidQ);
+  };
 
-  const askAboutVideo = async () => {
-    // 1. Verificar si hay guardado en sesión
-    // @ts-ignore
-    const now = Date.now();
+  const askAboutImage = async () => {
     const stored = lastMediaRef.current;
-    if (stored && (now - stored.ts < 60000)) {
-      const prompt = [{ text: 'El usuario pregunta por el contenido visual.' }, { inlineData: { mimeType: 'image/jpeg', data: stored.data.replace(/^data:image\/\w+;base64,/, '') } }, { text: `Contexto guardado: ${stored.title} (${stored.url})` }];
-      sendToGeminiSafe(prompt, true, true);
+    if (!stored || stored.type !== 'image') {
+      sendToGeminiSafe([{ text: 'No tengo ninguna imagen reciente.' }], true, true);
       return;
     }
-    // const { lastMedia } = ... (REMOVED)
-
-    // Si hay un video reciente guardado o queremos pedir frame en vivo
-    // La estrategia dice: Video solo si usuario pregunta -> pedir frame en vivo
-
-    // Pedimos 1 frame en vivo
-    const frame = await chrome.runtime.sendMessage({ type: 'GET_VIDEO_FRAME' });
-
-    if (!frame) {
-
-      sendToGeminiSafe([{ text: 'No veo ningún video reproduciéndose ahora mismo.' }], true, true);
-      return;
-    }
-
     const prompt = [
-      { text: 'El usuario acaba de pedirte que comentes el vídeo que está viendo.' },
-      { inlineData: { mimeType: 'image/jpeg', data: frame.frame.replace(/^data:image\/\w+;base64,/, '') } },
-      { text: `Título de la página: ${frame.title}. URL: ${frame.url}` }
+      { text: 'El usuario pregunta por la imagen que está viendo. descríbela con sarcasmo.' },
+      { inlineData: { mimeType: 'image/jpeg', data: stored.data.replace(/^data:image\/\w+;base64,/, '') } },
+      { text: `Contexto: ${stored.title} (${stored.url})` }
     ];
     sendToGeminiSafe(prompt, true, true);
   };
 
-  const sendToGeminiSafe = (parts: any[], turnComplete: boolean = true, skipVideoCheck: boolean = false) => {
-    // Intercepción para VIDEO
-    if (!skipVideoCheck && parts.length > 0 && parts[0].text) {
-      if (isVideoQuestion(parts[0].text)) {
-        console.log('[App] Detectada pregunta de video -> Iniciando captura bajo demanda');
-        askAboutVideo();
-        return;
+  const askAboutVideo = async () => {
+    const stored = lastMediaRef.current;
+
+    // 1. Si hay imagen reciente (< 120s) → usar URL directa (Gemini Vision)
+    if (stored && stored.type === 'image' && (Date.now() - stored.ts < 120_000)) {
+      const prompt = [
+        { text: 'El usuario pregunta por la imagen que está viendo.' },
+        { image: { url: stored.data } }, // <-- URL directa
+        { text: `Contexto: ${stored.title}` }
+      ];
+      sendToGeminiSafe(prompt, true, true);
+      return;
+    }
+
+    // 2. Si no hay imagen → pedimos frame de video (sin cambios)
+    const frame = await chrome.runtime.sendMessage({ type: 'GET_VIDEO_FRAME' });
+    if (!frame) {
+      sendToGeminiSafe([{ text: 'No veo ninguna imagen ni video ahora mismo.' }], true, true);
+      return;
+    }
+    const prompt = [
+      { text: 'El usuario acaba de pedirte que comentes el vídeo que está viendo.' },
+      { inlineData: { mimeType: 'image/jpeg', data: frame.frame.replace(/^data:image\/\w+;base64,/, '') } },
+      { text: `Título: ${frame.title}` }
+    ];
+    sendToGeminiSafe(prompt, true, true);
+  };
+
+  const sendToGeminiSafe = (parts: any[], turnComplete: boolean = true, skipMediaCheck: boolean = false) => {
+    // Intercepción universal
+    if (!skipMediaCheck && parts.length > 0 && parts[0].text) {
+      const t = parts[0].text;
+      if (isMediaQuestion(t)) {
+        if (/\b(imagen|foto)\b/i.test(t)) {
+          console.log('[App] Pregunta de imagen detectada');
+          askAboutImage();
+          return;
+        }
+        if (/\b(vídeo|video|clip)\b/i.test(t)) {
+          console.log('[App] Pregunta de video detectada');
+          askAboutVideo();
+          return;
+        }
       }
     }
 
@@ -369,6 +390,7 @@ const App: React.FC = () => {
       liveSessionRef.current = session;
       await initializeAudioInput(session);
       dispatch({ type: 'UPDATE_STATUS', payload: AssistantStatus.IDLE });
+      // ⬅️ Usar el contexto más reciente (el que acaba de llegar)
       if (latestTabContextRef.current) triggerSarcasticComment(latestTabContextRef.current);
     } catch (e) { shutdownSystem(); }
   };

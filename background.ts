@@ -77,8 +77,19 @@ function scheduleNavigationBroadcast(tabId: number, description: string) {
       // Si el título parece placeholder, esperamos 1s más
       if (isGenericTitle(tab.title || '')) {
         console.log('[Background] Título genérico detectado, re-intentando…');
-        pendingNavigationTimeout = null;
-        scheduleNavigationBroadcast(tabId, description); // re-schedule
+
+        const retryKey = `retry-${tabId}`;
+        // ⬅️ Persistimos el contador para que no se pierda si SW duerme
+        chrome.storage.session.get([retryKey]).then(r => {
+          const stored = r[retryKey] || 0;
+          if (stored >= 2) return; // ya agotamos
+
+          (globalThis as any)[retryKey] = stored + 1;
+          chrome.storage.session.set({ [retryKey]: stored + 1 });
+
+          pendingNavigationTimeout = null;
+          scheduleNavigationBroadcast(tabId, description);
+        });
         return;
       }
 
@@ -87,8 +98,12 @@ function scheduleNavigationBroadcast(tabId: number, description: string) {
       // Evitar duplicados solo si URL Y TÍTULO son iguales
       if (contextKey === lastBroadcastKey) {
         console.log("[Background] Same URL+Title, skipping");
+        const retryKey = `retry-${tabId}`;
+        chrome.storage.session.remove([retryKey]);
+        pendingNavigationTimeout = null;
         return;
       }
+
 
       const freshContext: ContextPayload = {
         url: tab.url,
@@ -109,6 +124,8 @@ function scheduleNavigationBroadcast(tabId: number, description: string) {
     } catch (error) {
       // Tab cerrado o UI no escuchando
     }
+    const retryKey = `retry-${tabId}`;
+    chrome.storage.session.remove([retryKey]);
     pendingNavigationTimeout = null;
   }, NAVIGATION_DEBOUNCE_MS);
 }
@@ -208,8 +225,8 @@ chrome.tabs.onUpdated.addListener((tabId: number, changeInfo: any, tab: any) => 
   // Reaccionar a cambios de URL O de título (SPAs actualizan título después)
   if (changeInfo.url || changeInfo.title) {
     if (isSPA(tab.url || '')) {
-      console.log('[Background] SPA detectada, esperando señal del content-script');
-      return; // ← no hagas nada, espera al content-script (SPA-Guard)
+      console.log('[Background] SPA detectada, **silencio total** – esperando content-script');
+      return; // ⬅️ NADA más
     }
 
     console.log("[Background] Tab updated:", changeInfo.url || changeInfo.title);
@@ -280,20 +297,20 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
     }
   }
 
-  // MEDIA_CAPTURED: Guardar en storage para uso bajo demanda
+  // MEDIA_CAPTURED: Guardar en storage (URL)
   if ((message as any).type === 'MEDIA_CAPTURED') {
-    // Guardamos la última imagen/video capturado
+    // Guardamos la URL, no base64
     // @ts-ignore
     chrome.storage.session.set({
       lastMedia: {
         type: (message as any).mediaType,
-        data: (message as any).data,
+        data: (message as any).data, // <-- ahora es una URL
         url: (message as any).url,
         title: (message as any).title,
         ts: Date.now()
       }
     });
-    console.log('[Background] Media guardado en sesión');
+    console.log('[Background] URL guardada:', (message as any).data);
   }
 
   // GET_VIDEO_FRAME proxy: Popup -> Background -> Active Tab
