@@ -215,6 +215,18 @@ declare const chrome: any;
   let lastGuardTitle = '';
   let lastEmittedKey = '';
 
+  // ⬅️ Clave **persistente** en sesión
+  const LAST_EMITTED_KEY = 'lastEmittedTitle';
+
+  async function getLastEmittedTitle(): Promise<string> {
+    const r = await chrome.storage.session.get([LAST_EMITTED_KEY]);
+    return r[LAST_EMITTED_KEY] || '';
+  }
+
+  async function setLastEmittedTitle(title: string) {
+    await chrome.storage.session.set({ [LAST_EMITTED_KEY]: title });
+  }
+
   // ⬅️ Cargar desde sesión (si existe)
   chrome.storage.session.get(['guardUrl', 'guardTitle', 'emittedKey']).then(r => {
     lastGuardUrl = r.guardUrl || location.href;
@@ -226,153 +238,53 @@ declare const chrome: any;
   const getContextKey = (url: string, title: string) => `${url}::${title}`;
   const isSameUrl = () => location.href === lastGuardUrl;
 
+  // ⬅️ Helper para limpiar notificaciones "(1) Título"
+  const getCleanTitle = () => document.title.replace(/^\(\d+\)\s*/, '').trim();
+
   let guardTimer: any;
-  const GUARD_DELAY = 700; // ms
+  // const GUARD_DELAY = 700; // ms (Eliminado)
 
-  function tryUniversalCommit(reason: string) {
-    // ⬅️ Permitimos re-lanzar si el título cambió (aunque URL sea igual)
-    if (document.title !== lastGuardTitle) {
-      lastGuardTitle = document.title;
-      lastEmittedKey = ''; // reseteamos para permitir nueva emisión
-    }
-
-    // ⬅️ RESET ANTES de emitir (evita URL anterior)
+  async function tryUniversalCommit(reason: string) {
     const cleanUrl = location.href.replace(/#.*$/, '');
-    if (cleanUrl !== lastGuardUrl.replace(/#.*$/, '')) {
-      lastGuardUrl = location.href;
-      lastGuardTitle = document.title;
-      lastEmittedKey = '';
-      // ⬅️ Persistimos en sesión para que no se pierda si SW duerme
-      chrome.storage.session.set({ guardUrl: lastGuardUrl, guardTitle: lastGuardTitle, emittedKey: lastEmittedKey });
-    }
+    // ⬅️ Solo bloqueamos si es la misma URL Y la razón NO es un cambio de título tardío
+    if (reason !== 'title mutado' && cleanUrl === lastGuardUrl.replace(/#.*$/, '')) return;
 
-    // 1. ¿URL cambió?
-    if (cleanUrl === lastGuardUrl.replace(/#.*$/, '')) return;
-
-    console.log('[Content] 🔄 Navegación detectada, esperando estabilidad DOM...', reason);
-
-    // 2. RESET inmediato de URL (para prevenir múltiples triggers)
     lastGuardUrl = location.href;
 
-    // 3. Cancelar cualquier check previo
-    if (guardTimer) clearInterval(guardTimer);
+    const lastEmitted = await getLastEmittedTitle();
+    const start = Date.now();
 
-    // 4. Sistema de ESTABILIDAD: el título debe mantenerse igual por 3 checks consecutivos
-    let lastSeenTitle = document.title;
-    let stableCount = 0;
-    const REQUIRED_STABLE_CHECKS = 3; // título debe ser igual 3 veces seguidas
-    const CHECK_INTERVAL = 100; // ms entre checks (más rápido)
+    // ⬅️ Bucle: esperamos hasta que el título sea DISTINTO al último emitido
+    let checks = 0;
+    const REQUIRED_CHECKS = 3; // debe ser igual 3 veces seguidas
+    const CHECK_MS = 150;
+    const MAX_WAIT = 2000;     // 2 s máximo
 
-    // Timeout diferenciado: videos normales necesitan más tiempo
-    const isVideoPage = location.pathname === '/watch';
-    const MAX_TIME = (reason === 'title mutado') ? 400 : (isVideoPage ? 2000 : 800); // ⬅️ 400 ms si cambió título
-    const startTime = Date.now();
-
-    guardTimer = setInterval(() => {
-      const currentTitle = document.title;
-      const elapsed = Date.now() - startTime;
-
-      // ¿Es un título genérico/placeholder? (lista expandida para videos)
-      const titleLower = currentTitle.toLowerCase().trim();
-      const isGeneric =
-        titleLower === '' ||
-        titleLower === 'youtube' ||
-        titleLower === 'home' ||
-        titleLower === 'watch' ||
-        titleLower === 'video' ||
-        titleLower.startsWith('youtube - ') ||
-        titleLower.endsWith(' - youtube') && currentTitle.split(' - ')[0].length < 5 ||
-        currentTitle === lastSeenTitle && stableCount === 0;
-
-      // Validación CRÍTICA: verificar que el h1 coincida con el título (para videos)
-      const isVideoPage = location.pathname === '/watch';
-      let titleMatchesContent = true;
-
-      if (isVideoPage && !isGeneric) {
-        const h1Element = document.querySelector('h1.ytd-watch-metadata, h1.title, ytd-watch-metadata h1');
-        const h1Text = h1Element?.textContent?.trim() || '';
-        const titleWithoutSuffix = currentTitle.replace(' - YouTube', '').trim();
-
-        if (h1Text.length > 3) {
-          titleMatchesContent = h1Text.includes(titleWithoutSuffix) || titleWithoutSuffix.includes(h1Text);
-
-          if (!titleMatchesContent) {
-            console.log(`[Content] ⚠️ Título desincronizado con h1: "${currentTitle}" vs "${h1Text}"`);
-            // Resetear contador - el DOM no está listo
-            stableCount = 0;
-            lastSeenTitle = currentTitle;
-            return; // No continuar hasta que coincidan
-          }
-        }
-      }
-
-      if (currentTitle === lastSeenTitle && !isGeneric && titleMatchesContent) {
-        // El título se mantuvo igual → aumentar contador de estabilidad
-        stableCount++;
-        console.log(`[Content] 📊 Título estable: "${currentTitle}" (${stableCount}/${REQUIRED_STABLE_CHECKS})`);
-
-        if (stableCount >= REQUIRED_STABLE_CHECKS) {
-          // ✅ TÍTULO ESTABLE → emitir
-          clearInterval(guardTimer);
-
-          // DUPLICADO: comprobamos clave completa (url + título)
-          const contextKey = getContextKey(location.href, currentTitle);
-          if (contextKey === lastEmittedKey) {
-            console.log('[Content] ⚠️ Contexto duplicado, no emitimos:', currentTitle);
-            return;
-          }
-          lastEmittedKey = contextKey;
-          lastGuardTitle = currentTitle;
-
-          // ⬅️ Persistimos en sesión para que no se pierda si SW duerme
-          chrome.storage.session.set({ guardUrl: lastGuardUrl, guardTitle: lastGuardTitle, emittedKey: lastEmittedKey });
-
-          console.log('[Content] ✓ Navegación confirmada (DOM estable):', currentTitle);
-          report(reason, 'navigate', document.body.innerText.substring(0, 1000));
-        }
+    while (checks < REQUIRED_CHECKS && Date.now() - start < MAX_WAIT) {
+      const current = document.title;
+      // Comparamos contra el último emitido (evitar eco)
+      // Y también contra "YouTube" o genéricos si queremos ser estrictos, pero el usuario pidió "distinto al último"
+      if (current !== lastEmitted && current.trim() !== '') {
+        checks++;
       } else {
-        // El título cambió → resetear contador
-        if (currentTitle !== lastSeenTitle) {
-          console.log(`[Content] 🔄 Título cambió: "${lastSeenTitle}" → "${currentTitle}"`);
-        }
-        lastSeenTitle = currentTitle;
-        stableCount = 0;
+        checks = 0; // reset si sigue siendo el mismo o está vacío
       }
+      await new Promise(res => setTimeout(res, CHECK_MS));
+    }
 
-      // Timeout de seguridad: si pasan 800ms, emitir de todas formas
-      if (elapsed >= MAX_TIME) {
-        clearInterval(guardTimer);
-        const finalTitle = document.title;
+    const finalTitle = document.title;
 
-        // Validación final ESTRICTA: verificar que el título coincida con h1 (para videos)
-        if (isVideoPage) {
-          const h1Element = document.querySelector('h1.ytd-watch-metadata, h1.title, ytd-watch-metadata h1');
-          const h1Text = h1Element?.textContent?.trim() || '';
-          const titleWithoutSuffix = finalTitle.replace(' - YouTube', '').trim();
-          const titleMatchesH1 = h1Text.includes(titleWithoutSuffix) || titleWithoutSuffix.includes(h1Text);
+    // ⬅️ VALIDACIÓN FINAL CRÍTICA:
+    // Si después de esperar, el título sigue siendo igual al último emitido... ¡NO HACEMOS NADA!
+    // Asumimos que la página sigue cargando y el MutationObserver nos avisará cuando cambie de verdad.
+    if (finalTitle === lastEmitted) {
+      console.log('[Content] ⏳ Título idéntico al anterior, esperando cambio real...');
+      return;
+    }
 
-          if (!titleMatchesH1 && h1Text.length > 3) {
-            console.log('[Content] ⚠️ Timeout alcanzado pero título NO coincide con h1:', finalTitle, 'vs', h1Text);
-            console.log('[Content] ❌ NO emitiendo - DOM aún desincronizado');
-            return; // NO emitir - el título está desincronizado
-          }
-        }
-
-        const contextKey = getContextKey(location.href, finalTitle);
-        if (contextKey === lastEmittedKey) {
-          console.log('[Content] ⚠️ Contexto duplicado (timeout), no emitimos:', finalTitle);
-          return;
-        }
-        lastEmittedKey = contextKey;
-        lastGuardTitle = finalTitle;
-
-        // ⬅️ Persistimos en sesión para que no se pierda si SW duerme
-        chrome.storage.session.set({ guardUrl: lastGuardUrl, guardTitle: lastGuardTitle, emittedKey: lastEmittedKey });
-
-        console.log('[Content] ⏱️ Timeout alcanzado, emitiendo con:', finalTitle);
-        report(reason, 'navigate', document.body.innerText.substring(0, 1000));
-      }
-    }, CHECK_INTERVAL);
+    // ⬅️ Emitimos título nuevo confirmado
+    await setLastEmittedTitle(finalTitle);
+    report(reason, 'navigate', document.body.innerText.substring(0, 1000));
   }
 
   // --- hooks ---
@@ -395,7 +307,8 @@ declare const chrome: any;
     new MutationObserver(() => {
       // Si el título cambia y la URL es DIFERENTE a la última reportada, intentar commit
       // (Ojo: tryUniversalCommit chequea si URL cambió)
-      // ⬅️ Forzamos estabilidad aunque la URL no haya cambiado
+
+      // ⬅️ Si cambió URL → esperamos título NUEVO
       tryUniversalCommit('title mutado');
     }).observe(titleTarget, { childList: true, subtree: true });
   } else {
@@ -431,4 +344,26 @@ declare const chrome: any;
       };
     }
   })();
+  /**
+   * Espera hasta que el título deje de ser genérico o cambie respecto al anterior.
+   * Si no cambia en 1.5 s, emite con lo que haya.
+   */
+  async function waitForRealTitle(reason: string) {
+    const start = Date.now();
+    const maxWait = 1500; // 1.5 s máximo
+    const initialTitle = document.title;
+    const isGeneric = (t: string) => ['youtube', 'home', 'watch', 'video', ''].includes(t.toLowerCase().trim());
+
+    while (Date.now() - start < maxWait) {
+      const current = document.title;
+      // ⬅️ Salimos si: ① no es genérico ② es distinto al inicial
+      if (!isGeneric(current) && current !== initialTitle) {
+        break;
+      }
+      await new Promise(res => setTimeout(res, 100)); // chequeamos cada 100 ms
+    }
+
+    // ⬅️ Emitimos **solo** con el título real (o el que haya al timeout)
+    report(reason, 'navigate', document.body.innerText.substring(0, 1000));
+  }
 })();
