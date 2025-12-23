@@ -63,6 +63,10 @@ declare const chrome: any;
     const target = e.target as HTMLElement;
     const btn = target.closest('button, a, [role="button"]');
     if (btn) {
+      // ⬅️ Si es un link real que cambia la URL, el evento de navegación lo manejará. Ignorar clic.
+      if (btn.tagName === 'A' && btn.getAttribute('href') && !btn.getAttribute('href')?.startsWith('#')) {
+        return;
+      }
       const label = btn.getAttribute('aria-label') || btn.textContent?.trim().substring(0, 30);
       report(`Hizo clic en: ${label || 'un elemento'}`, "interaction");
     }
@@ -216,8 +220,8 @@ declare const chrome: any;
     let lastGuardUrl = location.href;
     const LAST_EMITTED_KEY = 'lastEmittedTitle';
 
-    // Helper para limpiar notificaciones "(1) Título"
-    const getCleanTitle = () => document.title.replace(/^\(\d+\)\s*/, '').trim();
+    // Helper para limpiar notificaciones "(1)" o prefixes "▶"
+    const getCleanTitle = () => document.title.replace(/^(\(\d+\)|▶)\s*/, '').trim();
 
     async function getLastEmittedTitle(): Promise<string> {
       const r = await chrome.storage.session.get([LAST_EMITTED_KEY]);
@@ -236,54 +240,49 @@ declare const chrome: any;
     async function handleNavigationChange(reason: string) {
       const cleanUrl = location.href.replace(/#.*$/, '');
 
-      // 1. Verificación básica: Si la URL es la misma y NO fue un cambio de título, ignorar.
+      // 1. Si URL no cambió y no es mutación de título, ignorar.
       if (reason !== 'title mutado' && cleanUrl === lastGuardUrl.replace(/#.*$/, '')) return;
 
-      console.log(`[NavigationWatcher] Cambio detectado (${reason}). Esperando estabilidad...`);
+      console.log(`[NavigationWatcher] Cambio detectado (${reason}).`);
       lastGuardUrl = location.href;
       chrome.storage.session.set({ guardUrl: lastGuardUrl });
 
-      // ⬅️ Emitir "Cargando..." inmediatamente para limpiar UI
+      // ⬅️ Doble Reporte: 1. Aviso inmediato de "Cargando..."
       report('Navegando...', 'navigate', '');
+      chrome.runtime.sendMessage({ type: 'NAV_STARTING' }).catch(() => { });
 
       const lastEmitted = await getLastEmittedTitle();
       const start = Date.now();
 
-      // 2. Esperar a que el título LIMPIO sea nuevo y estable
-      let stableChecks = 0;
-      const REQUIRED_CHECKS = 3;
-      const CHECK_INTERVAL = 150;
-      const MAX_WAIT = 5000; // 5 segundos para sitios lentos
+      // 2. Esperar título NO genérico y DIFERENTE al anterior
+      const CHECK_INTERVAL = 200;
+      const MAX_WAIT = 5000;
+      const isGeneric = (t: string) => ['youtube', 'home', 'watch', 'video', 'cargando'].some(g => t.toLowerCase() === g);
 
-      while (stableChecks < REQUIRED_CHECKS && Date.now() - start < MAX_WAIT) {
-        const currentClean = getCleanTitle();
+      let finalTitle = getCleanTitle();
 
-        // Debe ser distinto al último emitido Y no estar vacío
-        if (currentClean !== lastEmitted && currentClean !== '') {
-          stableChecks++;
-        } else {
-          stableChecks = 0;
+      while (Date.now() - start < MAX_WAIT) {
+        const current = getCleanTitle();
+        // Condición de éxito: Título real, no vacío, y ha cambiado respecto al anterior
+        if (!isGeneric(current) && current !== '' && current !== lastEmitted) {
+          finalTitle = current;
+          break;
         }
         await new Promise(r => setTimeout(r, CHECK_INTERVAL));
       }
 
-      // 3. Validación final strict
-      const finalCleanTitle = getCleanTitle();
-
-      if (finalCleanTitle === lastEmitted) {
-        console.log(`[NavigationWatcher] ⏳ Título idéntico (${finalCleanTitle}) tras espera. Abortando.`);
-        return;
+      // 3. Fallback: Si sigue igual, usamos lo que haya, pero el background decidirá si lo descarta
+      if (finalTitle === lastEmitted) {
+        console.log(`[NavigationWatcher] ⏳ Título persiste igual (${finalTitle}). Enviando de todos modos para forzar sync.`);
       }
 
-      // 4. Emitir
-      console.log(`[NavigationWatcher] 🚀 Navegación confirmada: "${finalCleanTitle}"`);
-      await setLastEmittedTitle(finalCleanTitle);
-      report(reason, 'navigate', document.body.innerText.substring(0, 1000));
+      // 4. Emitir Reporte Final
+      console.log(`[NavigationWatcher] 🚀 Navegación confirmada: "${finalTitle}"`);
+      await setLastEmittedTitle(finalTitle);
+      report(`Navegó a: ${finalTitle}`, 'navigate', document.body.innerText.substring(0, 1000));
     }
 
     // --- Listeners ---
-
-    // History API hooks
     ['pushState', 'replaceState'].forEach(method => {
       // @ts-ignore
       const original = history[method];
@@ -297,71 +296,16 @@ declare const chrome: any;
 
     window.addEventListener('popstate', () => handleNavigationChange('history pop'));
 
-    // Title MutationObserver
-    const titleNode = document.querySelector('title');
-    if (titleNode) {
+    // Robust MutationObserver: Observa <head> por si cambian el nodo <title> entero
+    const head = document.querySelector('head');
+    if (head) {
       new MutationObserver(() => {
-        // Disparar siempre que cambie el título, handleNavigationChange filtrará si es necesario
         handleNavigationChange('title mutado');
-      }).observe(titleNode, { childList: true, subtree: true });
-    } else {
-      // Fallback
-      new MutationObserver(() => {
-        if (document.querySelector('title')) handleNavigationChange('title inject');
-      }).observe(document.head, { childList: true });
+      }).observe(head, { childList: true, subtree: true, characterData: true });
     }
-
-    console.log('[Content] Navigation Watcher Iniciado');
   }
 
   // Iniciar watcher
   initNavigationWatcher();
-
-  console.log('[Content] UNIVERSAL SPA-Guard activado');
-
-  /********************************************************************
-   *  CAPTURA EN PESTAÑA-IMAGEN (URL termina en .jpg .png .webp)
-   ********************************************************************/
-  (() => {
-    if (!/\.(jpg|jpeg|png|webp|avif)(\?.*)?$/i.test(location.pathname)) return;
-    const img = document.querySelector('img');
-    if (!img) return;
-    if (img.naturalWidth > 0) {
-      const data = captureImage(img);
-      if (data) {
-        chrome.runtime.sendMessage({ type: 'MEDIA_CAPTURED', mediaType: 'image', data, url: location.href, title: document.title });
-        console.log('[Content] Imagen pura capturada');
-      }
-    } else {
-      img.onload = () => {
-        const data = captureImage(img);
-        if (data) {
-          chrome.runtime.sendMessage({ type: 'MEDIA_CAPTURED', mediaType: 'image', data, url: location.href, title: document.title });
-          console.log('[Content] Imagen pura capturada');
-        }
-      };
-    }
-  })();
-  /**
-   * Espera hasta que el título deje de ser genérico o cambie respecto al anterior.
-   * Si no cambia en 1.5 s, emite con lo que haya.
-   */
-  async function waitForRealTitle(reason: string) {
-    const start = Date.now();
-    const maxWait = 1500; // 1.5 s máximo
-    const initialTitle = document.title;
-    const isGeneric = (t: string) => ['youtube', 'home', 'watch', 'video', ''].includes(t.toLowerCase().trim());
-
-    while (Date.now() - start < maxWait) {
-      const current = document.title;
-      // ⬅️ Salimos si: ① no es genérico ② es distinto al inicial
-      if (!isGeneric(current) && current !== initialTitle) {
-        break;
-      }
-      await new Promise(res => setTimeout(res, 100)); // chequeamos cada 100 ms
-    }
-
-    // ⬅️ Emitimos **solo** con el título real (o el que haya al timeout)
-    report(reason, 'navigate', document.body.innerText.substring(0, 1000));
-  }
+  console.log('[Content] Navigation Watcher Iniciado');
 })();

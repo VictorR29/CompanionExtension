@@ -108,6 +108,13 @@ const App: React.FC = () => {
         if (msg.type === 'SESSION_STATUS' && msg.active) {
           console.log('[App] Sesión previa detectada, reconectando...');
         }
+        // ⬅️ Visual feedback for routing
+        if (msg.type === 'NAV_STARTING') {
+          setCurrentDisplayContext({
+            title: 'Viajando a...',
+            url: '', description: '', timestamp: Date.now(), actionType: 'navigate'
+          });
+        }
         // (Listener VIDEO_FRAME eliminado - ahora es bajo demanda)
       });
     }
@@ -245,13 +252,26 @@ const App: React.FC = () => {
   // 3. SINCRONIZACIÓN DE MENSAJES (REACTIVIDAD TOTAL)
   useEffect(() => {
     const handleRuntimeMessage = (message: any) => {
+      // ⬅️ Manejo visual de transición
+      if (message.type === 'NAV_STARTING') {
+        setCurrentDisplayContext({
+          title: 'Viajando a...',
+          url: '', description: '', timestamp: Date.now(), actionType: 'navigate'
+        });
+        return;
+      }
+
       if (message.type === MessageType.CONTEXT_UPDATED) {
         const newContext = message.payload as ContextPayload;
         const isConnected = systemState.status === AssistantStatus.IDLE ||
           systemState.status === AssistantStatus.SPEAKING;
 
         latestTabContextRef.current = newContext;
-        setCurrentDisplayContext(newContext);
+
+        // ⬅️ Evitar flicker: Si el título es YouTube o vacío, mantenemos el anterior visualmente
+        if (newContext.title && newContext.title !== 'YouTube' && newContext.title.trim() !== '') {
+          setCurrentDisplayContext(newContext);
+        }
 
         if (!isConnected) return;
 

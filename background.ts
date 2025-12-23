@@ -37,6 +37,7 @@ let currentActiveTabId: number | null = null;
 // Sistema de debounce - trackea URL Y TÍTULO para detectar cambios reales
 let pendingNavigationTimeout: ReturnType<typeof setTimeout> | null = null;
 let lastBroadcastKey: string = ''; // URL + Título combinados
+let isNavigating: boolean = false; // ⬅️ Guardia de transición
 const NAVIGATION_DEBOUNCE_MS = 1000; // 1s de gracia para SPAs como YouTube
 
 // --- HELPERS DE NAVEGACIÓN ---
@@ -275,9 +276,28 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
       return;
     }
 
+    // ⬅️ BLOQUEO si estamos navegando (ignoramos clicks/interacciones viejas)
+    if (isNavigating && payload.actionType !== 'navigate') {
+      return;
+    }
+
     // Si es navegación desde content-script, actualizar estado directamente
     if (payload.actionType === 'navigate' && payload.url) {
       console.log('[Background] ✓ Commit recibido:', payload.title, payload.url);
+
+      // ⬅️ VALIDACIÓN DE INTEGRIDAD: Si título es igual al anterior pero URL distinta, ignorar (premature)
+      if (payload.title === currentContextState.title && payload.url !== currentContextState.url) {
+        console.log('[Background] ⚠️ Título desincronizado (URL nueva, Título viejo). Esperando...');
+        // Esperamos 500ms extra por si acaso llega el bueno
+        setTimeout(() => { }, 500);
+        return;
+      }
+
+      // ⬅️ Resetear clave de broadcast para aceptar el nuevo estado incondicionalmente
+      lastBroadcastKey = '';
+      isNavigating = false; // 🔓 Desbloqueamos interacciones
+
+      currentContextState = payload;
 
       // ⬅️ Resetear clave de broadcast para aceptar el nuevo estado incondicionalmente
       lastBroadcastKey = '';
@@ -301,6 +321,13 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
       if (tabId) scheduleNavigationBroadcast(tabId, 'El usuario usó navegación del historial');
     }
   }
+
+  // ⬅️ SEÑAL DE INICIO DE NAVEGACIÓN (SPA)
+  if ((message as any).type === 'NAV_STARTING') {
+    isNavigating = true; // 🔒 Bloqueamos interacciones
+    console.log('[Background] 🔒 Navegación iniciada (interacciones pausadas)');
+  }
+
 
   // MEDIA_CAPTURED: Guardar en storage (URL)
   if ((message as any).type === 'MEDIA_CAPTURED') {
