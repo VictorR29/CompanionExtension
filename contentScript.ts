@@ -35,15 +35,16 @@ declare const chrome: any;
     if (type !== 'navigate' && (now - lastInteractionTime) < CONFIG.INTERACTION_COOLDOWN) return;
 
     lastInteractionTime = now;
-    const payload: ContextPayload = {
-      url: window.location.href,
+    // ⬅️ Forzar URL más fresca siempre
+    const freshPayload: ContextPayload = {
+      url: location.href,
       title: document.title,
       description: desc,
       timestamp: now,
       actionType: type,
       pageContent: extra
     };
-    chrome.runtime.sendMessage({ type: MessageType.BROWSER_ACTIVITY, payload }).catch(() => { });
+    chrome.runtime.sendMessage({ type: MessageType.BROWSER_ACTIVITY, payload: freshPayload }).catch(() => { });
   }
 
   // 1. Navegación (Manejada por SPA-Guard al final del archivo)
@@ -208,116 +209,113 @@ declare const chrome: any;
   });
 
   /*********************************************************************
-   *  UNIVERSAL SPA-Guard
+   *  UNIVERSAL SPA-Guard (Encapsulated)
    *  Emite navegación solo cuando URL+contenido sean ESTABLES
    *********************************************************************/
-  let lastGuardUrl = '';
-  let lastGuardTitle = '';
-  let lastEmittedKey = '';
+  function initNavigationWatcher() {
+    let lastGuardUrl = location.href;
+    const LAST_EMITTED_KEY = 'lastEmittedTitle';
 
-  // ⬅️ Clave **persistente** en sesión
-  const LAST_EMITTED_KEY = 'lastEmittedTitle';
+    // Helper para limpiar notificaciones "(1) Título"
+    const getCleanTitle = () => document.title.replace(/^\(\d+\)\s*/, '').trim();
 
-  async function getLastEmittedTitle(): Promise<string> {
-    const r = await chrome.storage.session.get([LAST_EMITTED_KEY]);
-    return r[LAST_EMITTED_KEY] || '';
-  }
+    async function getLastEmittedTitle(): Promise<string> {
+      const r = await chrome.storage.session.get([LAST_EMITTED_KEY]);
+      return r[LAST_EMITTED_KEY] || '';
+    }
 
-  async function setLastEmittedTitle(title: string) {
-    await chrome.storage.session.set({ [LAST_EMITTED_KEY]: title });
-  }
+    async function setLastEmittedTitle(title: string) {
+      await chrome.storage.session.set({ [LAST_EMITTED_KEY]: title });
+    }
 
-  // ⬅️ Cargar desde sesión (si existe)
-  chrome.storage.session.get(['guardUrl', 'guardTitle', 'emittedKey']).then(r => {
-    lastGuardUrl = r.guardUrl || location.href;
-    lastGuardTitle = r.guardTitle || document.title;
-    lastEmittedKey = r.emittedKey || '';
-  });
+    // Cargar estado inicial
+    chrome.storage.session.get(['guardUrl']).then(r => {
+      if (r.guardUrl) lastGuardUrl = r.guardUrl;
+    });
 
-  // --- helpers ---
-  const getContextKey = (url: string, title: string) => `${url}::${title}`;
-  const isSameUrl = () => location.href === lastGuardUrl;
+    async function handleNavigationChange(reason: string) {
+      const cleanUrl = location.href.replace(/#.*$/, '');
 
-  // ⬅️ Helper para limpiar notificaciones "(1) Título"
-  const getCleanTitle = () => document.title.replace(/^\(\d+\)\s*/, '').trim();
+      // 1. Verificación básica: Si la URL es la misma y NO fue un cambio de título, ignorar.
+      if (reason !== 'title mutado' && cleanUrl === lastGuardUrl.replace(/#.*$/, '')) return;
 
-  let guardTimer: any;
-  // const GUARD_DELAY = 700; // ms (Eliminado)
+      console.log(`[NavigationWatcher] Cambio detectado (${reason}). Esperando estabilidad...`);
+      lastGuardUrl = location.href;
+      chrome.storage.session.set({ guardUrl: lastGuardUrl });
 
-  async function tryUniversalCommit(reason: string) {
-    const cleanUrl = location.href.replace(/#.*$/, '');
-    // ⬅️ Solo bloqueamos si es la misma URL Y la razón NO es un cambio de título tardío
-    if (reason !== 'title mutado' && cleanUrl === lastGuardUrl.replace(/#.*$/, '')) return;
+      // ⬅️ Emitir "Cargando..." inmediatamente para limpiar UI
+      report('Navegando...', 'navigate', '');
 
-    lastGuardUrl = location.href;
+      const lastEmitted = await getLastEmittedTitle();
+      const start = Date.now();
 
-    const lastEmitted = await getLastEmittedTitle();
-    const start = Date.now();
+      // 2. Esperar a que el título LIMPIO sea nuevo y estable
+      let stableChecks = 0;
+      const REQUIRED_CHECKS = 3;
+      const CHECK_INTERVAL = 150;
+      const MAX_WAIT = 5000; // 5 segundos para sitios lentos
 
-    // ⬅️ Bucle: esperamos hasta que el título sea DISTINTO al último emitido
-    let checks = 0;
-    const REQUIRED_CHECKS = 3; // debe ser igual 3 veces seguidas
-    const CHECK_MS = 150;
-    const MAX_WAIT = 2000;     // 2 s máximo
+      while (stableChecks < REQUIRED_CHECKS && Date.now() - start < MAX_WAIT) {
+        const currentClean = getCleanTitle();
 
-    while (checks < REQUIRED_CHECKS && Date.now() - start < MAX_WAIT) {
-      const current = document.title;
-      // Comparamos contra el último emitido (evitar eco)
-      // Y también contra "YouTube" o genéricos si queremos ser estrictos, pero el usuario pidió "distinto al último"
-      if (current !== lastEmitted && current.trim() !== '') {
-        checks++;
-      } else {
-        checks = 0; // reset si sigue siendo el mismo o está vacío
+        // Debe ser distinto al último emitido Y no estar vacío
+        if (currentClean !== lastEmitted && currentClean !== '') {
+          stableChecks++;
+        } else {
+          stableChecks = 0;
+        }
+        await new Promise(r => setTimeout(r, CHECK_INTERVAL));
       }
-      await new Promise(res => setTimeout(res, CHECK_MS));
+
+      // 3. Validación final strict
+      const finalCleanTitle = getCleanTitle();
+
+      if (finalCleanTitle === lastEmitted) {
+        console.log(`[NavigationWatcher] ⏳ Título idéntico (${finalCleanTitle}) tras espera. Abortando.`);
+        return;
+      }
+
+      // 4. Emitir
+      console.log(`[NavigationWatcher] 🚀 Navegación confirmada: "${finalCleanTitle}"`);
+      await setLastEmittedTitle(finalCleanTitle);
+      report(reason, 'navigate', document.body.innerText.substring(0, 1000));
     }
 
-    const finalTitle = document.title;
+    // --- Listeners ---
 
-    // ⬅️ VALIDACIÓN FINAL CRÍTICA:
-    // Si después de esperar, el título sigue siendo igual al último emitido... ¡NO HACEMOS NADA!
-    // Asumimos que la página sigue cargando y el MutationObserver nos avisará cuando cambie de verdad.
-    if (finalTitle === lastEmitted) {
-      console.log('[Content] ⏳ Título idéntico al anterior, esperando cambio real...');
-      return;
+    // History API hooks
+    ['pushState', 'replaceState'].forEach(method => {
+      // @ts-ignore
+      const original = history[method];
+      // @ts-ignore
+      history[method] = function (...args) {
+        original.apply(this, args);
+        window.dispatchEvent(new Event(method));
+        handleNavigationChange(method);
+      };
+    });
+
+    window.addEventListener('popstate', () => handleNavigationChange('history pop'));
+
+    // Title MutationObserver
+    const titleNode = document.querySelector('title');
+    if (titleNode) {
+      new MutationObserver(() => {
+        // Disparar siempre que cambie el título, handleNavigationChange filtrará si es necesario
+        handleNavigationChange('title mutado');
+      }).observe(titleNode, { childList: true, subtree: true });
+    } else {
+      // Fallback
+      new MutationObserver(() => {
+        if (document.querySelector('title')) handleNavigationChange('title inject');
+      }).observe(document.head, { childList: true });
     }
 
-    // ⬅️ Emitimos título nuevo confirmado
-    await setLastEmittedTitle(finalTitle);
-    report(reason, 'navigate', document.body.innerText.substring(0, 1000));
+    console.log('[Content] Navigation Watcher Iniciado');
   }
 
-  // --- hooks ---
-  ['pushState', 'replaceState'].forEach(method => {
-    // @ts-ignore
-    const original = history[method];
-    // @ts-ignore
-    history[method] = function (...args) {
-      original.apply(this, args);
-      window.dispatchEvent(new Event(method)); // para otros listeners si los hubiera
-      tryUniversalCommit(method);
-    };
-  });
-
-  window.addEventListener('popstate', () => tryUniversalCommit('history pop'));
-
-  // MutationObserver solo para título (barato)
-  const titleTarget = document.querySelector('title');
-  if (titleTarget) {
-    new MutationObserver(() => {
-      // Si el título cambia y la URL es DIFERENTE a la última reportada, intentar commit
-      // (Ojo: tryUniversalCommit chequea si URL cambió)
-
-      // ⬅️ Si cambió URL → esperamos título NUEVO
-      tryUniversalCommit('title mutado');
-    }).observe(titleTarget, { childList: true, subtree: true });
-  } else {
-    // Fallback simple
-    new MutationObserver(() => {
-      const t = document.querySelector('title');
-      if (t && !isSameUrl()) tryUniversalCommit('title inject');
-    }).observe(document.head, { childList: true });
-  }
+  // Iniciar watcher
+  initNavigationWatcher();
 
   console.log('[Content] UNIVERSAL SPA-Guard activado');
 

@@ -270,6 +270,9 @@ const App: React.FC = () => {
         }
 
         if (newContext.actionType === 'navigate') {
+          // ⬅️ Reset selection on new page load
+          lastSelectedTextRef.current = null;
+
           // Evitar eco de la misma página (URL + Título)
           const contextKey = `${newContext.url}|||${newContext.title}`;
           if (contextKey === lastProcessedUrlRef.current) return;

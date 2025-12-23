@@ -229,8 +229,9 @@ chrome.tabs.onUpdated.addListener((tabId: number, changeInfo: any, tab: any) => 
       return; // ⬅️ NADA más
     }
 
-    console.log("[Background] Tab updated:", changeInfo.url || changeInfo.title);
-    scheduleNavigationBroadcast(tabId, 'El usuario navegó a nuevo contenido');
+    // Desactivamos la lógica de adivinación para evitar capturar títulos viejos
+    // console.log("[Background] Tab updated:", changeInfo.url || changeInfo.title);
+    // scheduleNavigationBroadcast(tabId, 'El usuario navegó a nuevo contenido');
   }
 });
 
@@ -277,8 +278,12 @@ chrome.runtime.onMessage.addListener((message: AppMessage, sender: any, sendResp
     // Si es navegación desde content-script, actualizar estado directamente
     if (payload.actionType === 'navigate' && payload.url) {
       console.log('[Background] ✓ Commit recibido:', payload.title, payload.url);
+
+      // ⬅️ Resetear clave de broadcast para aceptar el nuevo estado incondicionalmente
+      lastBroadcastKey = '';
+
       currentContextState = payload;
-      lastBroadcastKey = getContextKey(payload.url, payload.title);
+      // lastBroadcastKey = getContextKey(payload.url, payload.title); // Ya no la seteamos aquí para no bloquear
       chrome.runtime.sendMessage({ type: MessageType.CONTEXT_UPDATED, payload });
       return;
     }
